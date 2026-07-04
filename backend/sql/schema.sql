@@ -60,7 +60,11 @@ CREATE INDEX idx_cards_set_id ON cards (set_id);
 -- Records every review attempt a user makes on a card. This is the primary
 -- data table for the FSRS spaced repetition algorithm. Each event captures
 -- the user's response, correctness, and the resulting scheduler state
--- (ease factor, interval, next review date).
+-- (stability, difficulty, interval, next review date).
+--
+-- FSRS state columns (stability, difficulty) were added by migration
+-- 0001_add_fsrs_fields.sql following ADR 0001. The legacy ease_factor column
+-- is retained but unused post-FSRS-adoption; see migration 0001 for details.
 -- ---------------------------------------------------------------------------
 CREATE TABLE learning_events (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -68,7 +72,9 @@ CREATE TABLE learning_events (
     user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     response        TEXT,  -- the user's free-form answer, if provided
     is_correct      BOOLEAN NOT NULL,
-    ease_factor     FLOAT NOT NULL DEFAULT 2.5,  -- FSRS/SM-2 ease multiplier
+    ease_factor     FLOAT NOT NULL DEFAULT 2.5,  -- LEGACY/UNUSED post-FSRS (see ADR 0001 + migration 0001); FSRS uses stability + difficulty instead
+    stability       FLOAT,  -- FSRS: days until recall drops from 100% to 90% (nullable for pre-FSRS rows)
+    difficulty       FLOAT,  -- FSRS: inherent card hardness 1-10, mean-reverting (nullable for pre-FSRS rows)
     interval        INTEGER NOT NULL DEFAULT 0,  -- days until next review
     next_review_at  TIMESTAMPTZ NOT NULL,  -- when this card should next be reviewed
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
