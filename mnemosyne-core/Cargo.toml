@@ -4,4 +4,5 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
 fsrs = "6.6.1"
