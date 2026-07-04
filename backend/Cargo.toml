@@ -1,0 +1,9 @@
+[package]
+name = "backend"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+actix-web = "4.14.0"
+core = { path = "../core" }
+tokio = { version = "1.52.3", features = ["full"] }
