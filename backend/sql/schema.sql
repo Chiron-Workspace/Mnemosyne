@@ -1,0 +1,109 @@
+-- =============================================================================
+-- Mnemosyne Database Schema
+-- PostgreSQL DDL for the Mnemosyne personalized learning platform.
+-- Assumes a PostgreSQL 14+ database with pgcrypto extension for UUID generation.
+-- =============================================================================
+
+-- Enable UUID generation
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- ---------------------------------------------------------------------------
+-- Table: users
+-- Core user accounts. Each user has a unique email and optional learning style
+-- preference that helps the AI adapt pedagogical approach.
+-- ---------------------------------------------------------------------------
+CREATE TABLE users (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email           TEXT NOT NULL UNIQUE,
+    learning_style  TEXT,  -- e.g., 'text', 'kinesthetic', 'visual', 'auditory'
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_users_email ON users (email);
+
+-- ---------------------------------------------------------------------------
+-- Table: study_sets
+-- A collection of flashcards grouped by topic or subject area. Each set is
+-- owned by exactly one user and can optionally be tagged with a topic for
+-- organizational purposes.
+-- ---------------------------------------------------------------------------
+CREATE TABLE study_sets (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    topic       TEXT,  -- optional subject classification
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_study_sets_user_id ON study_sets (user_id);
+CREATE INDEX idx_study_sets_topic ON study_sets (topic);
+
+-- ---------------------------------------------------------------------------
+-- Table: cards
+-- Individual flashcards belonging to a study set. Each card contains a
+-- question (prompt) and an answer (the target knowledge to be recalled).
+-- ---------------------------------------------------------------------------
+CREATE TABLE cards (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    set_id      UUID NOT NULL REFERENCES study_sets(id) ON DELETE CASCADE,
+    question    TEXT NOT NULL,
+    answer      TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_cards_set_id ON cards (set_id);
+
+-- ---------------------------------------------------------------------------
+-- Table: learning_events
+-- Records every review attempt a user makes on a card. This is the primary
+-- data table for the FSRS spaced repetition algorithm. Each event captures
+-- the user's response, correctness, and the resulting scheduler state
+-- (ease factor, interval, next review date).
+-- ---------------------------------------------------------------------------
+CREATE TABLE learning_events (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    card_id         UUID NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    response        TEXT,  -- the user's free-form answer, if provided
+    is_correct      BOOLEAN NOT NULL,
+    ease_factor     FLOAT NOT NULL DEFAULT 2.5,  -- FSRS/SM-2 ease multiplier
+    interval        INTEGER NOT NULL DEFAULT 0,  -- days until next review
+    next_review_at  TIMESTAMPTZ NOT NULL,  -- when this card should next be reviewed
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_learning_events_card_id ON learning_events (card_id);
+CREATE INDEX idx_learning_events_user_id ON learning_events (user_id);
+CREATE INDEX idx_learning_events_next_review_at ON learning_events (next_review_at);
+CREATE INDEX idx_learning_events_user_card ON learning_events (user_id, card_id);
+
+-- ---------------------------------------------------------------------------
+-- Table: ai_interactions
+-- Logs all exchanges between the user and the DeepSeek AI tutor. Used for
+-- cost tracking, quality monitoring, and improving the AI's pedagogical
+-- effectiveness over time. The interaction_type enum classifies the
+-- pedagogical purpose of each exchange.
+-- ---------------------------------------------------------------------------
+
+-- Define the interaction type enum
+CREATE TYPE ai_interaction_type AS ENUM (
+    'question_generation',
+    'socratic_dialogue',
+    'feynman_evaluation'
+);
+
+CREATE TABLE ai_interactions (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id             UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    interaction_type    ai_interaction_type NOT NULL,
+    input_text          TEXT NOT NULL,   -- the user's message to the AI
+    output_text         TEXT NOT NULL,   -- the AI's response
+    tokens_used         INTEGER NOT NULL DEFAULT 0,  -- LLM token count for cost tracking
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_ai_interactions_user_id ON ai_interactions (user_id);
+CREATE INDEX idx_ai_interactions_type ON ai_interactions (interaction_type);
+CREATE INDEX idx_ai_interactions_created_at ON ai_interactions (created_at);
