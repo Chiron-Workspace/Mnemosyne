@@ -226,7 +226,7 @@ name = "backend"
 version = "0.1.0"
 dependencies = [
  "actix-web",
- "core",
+ "mnemosyne-core",
  "tokio",
 ]
 
@@ -340,13 +340,6 @@ dependencies = [
  "percent-encoding",
  "time",
  "version_check",
-]
-
-[[package]]
-name = "core"
-version = "0.1.0"
-dependencies = [
- "fsrs",
 ]
 
 [[package]]
@@ -890,6 +883,13 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mnemosyne-core"
+version = "0.1.0"
+dependencies = [
+ "fsrs",
 ]
 
 [[package]]

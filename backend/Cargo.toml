@@ -5,5 +5,5 @@ edition.workspace = true
 
 [dependencies]
 actix-web = "4.14.0"
-core = { path = "../core" }
+mnemosyne-core = { path = "../mnemosyne-core" }
 tokio = { version = "1.52.3", features = ["full"] }
