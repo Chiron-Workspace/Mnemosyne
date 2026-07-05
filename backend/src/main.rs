@@ -4,6 +4,7 @@ use sqlx::PgPool;
 
 use mnemosyne_core::scheduling::FsrsScheduler;
 
+mod deepseek;
 mod handlers;
 
 #[get("/health")]
@@ -70,10 +71,20 @@ async fn main() -> std::io::Result<()> {
     // web::Data (which is Arc internally; no Clone needed on the scheduler).
     let scheduler = web::Data::new(FsrsScheduler::default());
 
+    // Construct the DeepSeek HTTP client once and share it the same way. Fails
+    // fast at startup if the API key is missing — silent absence of an AI
+    // subsystem is worse than a clear panic.
+    let deepseek_client = deepseek::DeepSeekClient::from_env().unwrap_or_else(|| {
+        panic!("DEEPSEEK_API_KEY is not set in .env. Add it (see .env.example).");
+    });
+    eprintln!("[mnemosyne] DeepSeek client ready");
+    let deepseek = web::Data::new(deepseek_client);
+
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(pool.clone()))
             .app_data(scheduler.clone())
+            .app_data(deepseek.clone())
             .service(health)
             .service(health_db)
             .service(handlers::users::create_user)
@@ -83,6 +94,7 @@ async fn main() -> std::io::Result<()> {
             .service(handlers::cards::create_card)
             .service(handlers::cards::list_cards)
             .service(handlers::reviews::review)
+            .service(handlers::generate::generate_cards)
     })
     .bind(("127.0.0.1", 8081))?
     .run()
