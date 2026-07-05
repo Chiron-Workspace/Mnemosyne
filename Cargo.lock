@@ -250,11 +250,14 @@ name = "backend"
 version = "0.1.0"
 dependencies = [
  "actix-web",
+ "chrono",
  "dotenvy",
  "mnemosyne-core",
+ "serde",
  "serde_json",
  "sqlx",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -375,6 +378,7 @@ checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
  "num-traits",
+ "serde",
  "windows-link",
 ]
 
@@ -2165,6 +2169,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf80a72845275afea99e7f2b434723d3bc7e38470fcd1c7ed39a599c73319a53"
 dependencies = [
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
