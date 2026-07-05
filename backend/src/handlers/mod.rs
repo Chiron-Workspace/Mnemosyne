@@ -5,6 +5,7 @@
 //! endpoints in this module: `{"error": "<message>"}`.
 
 pub mod cards;
+pub mod reviews;
 pub mod study_sets;
 pub mod users;
 

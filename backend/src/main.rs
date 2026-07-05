@@ -2,6 +2,8 @@ use actix_web::{get, web, App, HttpServer, HttpResponse};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 
+use mnemosyne_core::scheduling::FsrsScheduler;
+
 mod handlers;
 
 #[get("/health")]
@@ -64,9 +66,14 @@ async fn main() -> std::io::Result<()> {
         });
     eprintln!("[mnemosyne] DB pool ready");
 
+    // Construct the FSRS scheduler once and share it across all workers via
+    // web::Data (which is Arc internally; no Clone needed on the scheduler).
+    let scheduler = web::Data::new(FsrsScheduler::default());
+
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(pool.clone()))
+            .app_data(scheduler.clone())
             .service(health)
             .service(health_db)
             .service(handlers::users::create_user)
@@ -75,6 +82,7 @@ async fn main() -> std::io::Result<()> {
             .service(handlers::study_sets::list_study_sets)
             .service(handlers::cards::create_card)
             .service(handlers::cards::list_cards)
+            .service(handlers::reviews::review)
     })
     .bind(("127.0.0.1", 8081))?
     .run()
