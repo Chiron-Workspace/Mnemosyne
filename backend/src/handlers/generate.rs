@@ -26,6 +26,15 @@ const MAX_NUM_QUESTIONS: u32 = 10;
 pub struct GenerateCardsRequest {
     pub source_text: String,
     pub num_questions: Option<u32>,
+    /// Optional style control — "recall" (1-5 word answers, active-recall SAFMEDS)
+    /// or "elaboration" (deeper 1-3 sentence Feynman-style answers). Defaults to
+    /// "recall" when omitted. Rejected with 400 for any other value.
+    #[serde(default = "default_style")]
+    pub question_style: String,
+}
+
+fn default_style() -> String {
+    "recall".to_string()
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -123,33 +132,45 @@ pub async fn generate_cards(
         );
     };
 
-    // 4. Build the prompt. Two messages: a strict system instruction that
-    //    constrains output to pure JSON, and the user message carrying the
-    //    source text and the requested count.
-    let system_prompt = format!(
-        "You are a flashcard author. Generate exactly {n} question/answer pairs \
-         testing UNDERSTANDING of the source text (active recall: questions that \
-         require retrieving or applying information, not copy-pasting sentences \
-         back). Respond with ONLY valid JSON: an array of objects, each shaped \
-         exactly like {{\"question\": string, \"answer\": string}}. No prose, no \
-         markdown, no code fences, no commentary outside the JSON. The JSON must \
-         parse with `serde_json::from_str::<Vec<QAPair>>` directly.",
-        n = num_questions
-    );
-    let user_prompt = format!("Source text:\n\n{trimmed}\n\nGenerate {num_questions} pairs.");
+    // 2b. Validate question_style. Only "recall" and "elaboration" are accepted;
+    //    anything else (including empty string when not defaulted) is rejected.
+    let style = body.question_style.trim().to_lowercase();
+    if style != "recall" && style != "elaboration" {
+        return error_response(
+            actix_web::http::StatusCode::BAD_REQUEST,
+            format!(
+                "invalid question_style '{0}': must be 'recall' or 'elaboration'",
+                body.question_style
+            ),
+        );
+    }
+
+    // 4. Build the prompt. Two distinct prompt strategies share the output-
+    //    format constraint (pure JSON array of {question, answer}) but differ
+    //    in how they instruct the model about content.
+    let is_recall = style == "recall";
+
+    let (system_prompt, user_prompt) = if is_recall {
+        build_recall_prompt(num_questions, trimmed)
+    } else {
+        build_elaboration_prompt(num_questions, trimmed)
+    };
+
     let messages = vec![
         DeepSeekMessage::system(system_prompt.clone()),
         DeepSeekMessage::user(user_prompt.clone()),
     ];
 
+    // We always log the ai_interactions row, in success OR failure. The
+    // "input_text" we log is the literal prompt sent — system + user joined,
+    // prefixed with a style tag so any query of ai_interactions later can
+    // distinguish which mode produced each interaction without needing a new
+    // schema column.
+    let prompt_log = format!("[style: {style}]\n[system] {system_prompt}\n[user] {user_prompt}");
+
     // 5. Call DeepSeek.
     let outcome: Result<crate::deepseek::DeepSeekResponse, crate::deepseek::DeepSeekError> =
         deepseek.chat_completion(&messages, Some(DEFAULT_MODEL)).await;
-
-    // We always log the ai_interactions row, in success OR failure. The
-    // "input_text" we log is the literal prompt sent (system + user joined),
-    // preserving what the assistant saw for debugging and cost attribution.
-    let prompt_log = format!("[system] {system_prompt}\n[user] {user_prompt}");
 
     match outcome {
         Ok(resp) => {
@@ -302,6 +323,63 @@ pub async fn generate_cards(
             )
         }
     }
+}
+
+/// Build a **recall**-style prompt (SAFMEDS — short factual active recall).
+///
+/// The system prompt includes two concrete few-shot examples so the model has
+/// a pattern to imitate, not just a rule to follow. Answers should be 1-5
+/// words: a fact, name, date, number, or short phrase — NOT a sentence.
+fn build_recall_prompt(num_questions: u32, source: &str) -> (String, String) {
+    let system = format!(
+        "You are a SAFMEDS-style flashcard author. Generate exactly {n} \
+         question/answer pairs from the provided source text that test FACTUAL \
+         RECALL — who, what, when, where, how many, define, name. Each answer \
+         MUST be a SHORT, single fact: 1-5 words (a name, date, number, term, \
+         or short phrase). Do NOT write sentences or explanations.\n\
+         \n\
+         Example format (real pairs you should imitate):\n\
+         [{{\"question\": \"What year did Columbus first reach the Caribbean?\", \
+         \"answer\": \"1492\"}},\n\
+         {{\"question\": \"Which disease devastated Native American populations \
+         during the Columbian Exchange?\", \"answer\": \"smallpox\"}}]\n\
+         \n\
+         Respond with ONLY valid JSON — an array of exactly {n} objects, each \
+         shaped {{\"question\": string, \"answer\": string}}. No prose, no \
+         markdown fences, no commentary outside the JSON. The JSON must parse \
+         with `serde_json::from_str::<Vec<QAPair>>` directly.",
+        n = num_questions
+    );
+    let user = format!(
+        "Source text:\n\n{source}\n\nGenerate {n} SAFMEDS-style short recall pairs.",
+        n = num_questions
+    );
+    (system, user)
+}
+
+/// Build an **elaboration**-style prompt (Feynman / deep understanding).
+///
+/// Questions require synthesis, application, or explaining WHY/HOW. Answers
+/// may be 1-3 sentences. This is the Prompt 4 style, tightened slightly to
+/// reinforce the conceptual tone.
+fn build_elaboration_prompt(num_questions: u32, source: &str) -> (String, String) {
+    let system = format!(
+        "You are a flashcard author. Generate exactly {n} question/answer pairs \
+         that test DEEPER UNDERSTANDING of the source text. Questions should \
+         require synthesizing information, explaining causal relationships, \
+         applying concepts to new scenarios, or connecting ideas — NOT just \
+         repeating isolated facts. Answers may be 1-3 sentences long.\n\
+         \n\
+         Respond with ONLY valid JSON: an array of exactly {n} objects, each \
+         shaped {{\"question\": string, \"answer\": string}}. No prose, no \
+         markdown fences, no commentary outside the JSON.",
+        n = num_questions
+    );
+    let user = format!(
+        "Source text:\n\n{source}\n\nGenerate {n} elaboration-style pairs.",
+        n = num_questions
+    );
+    (system, user)
 }
 
 /// Strip a leading ```` ```json ```` (or ```` ``` ````) fence and trailing
