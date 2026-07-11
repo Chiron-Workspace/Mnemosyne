@@ -95,6 +95,7 @@ async fn main() -> std::io::Result<()> {
             .service(handlers::cards::list_cards)
             .service(handlers::reviews::review)
             .service(handlers::generate::generate_cards)
+            .service(handlers::due::due)
     })
     .bind(("127.0.0.1", 8081))?
     .run()
