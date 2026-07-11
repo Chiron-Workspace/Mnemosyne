@@ -8,6 +8,7 @@ pub mod cards;
 pub mod due;
 pub mod generate;
 pub mod reviews;
+pub mod socratic;
 pub mod study_sets;
 pub mod users;
 

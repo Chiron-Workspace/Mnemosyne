@@ -36,6 +36,9 @@ impl DeepSeekMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self { role: "user", content: content.into() }
     }
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self { role: "assistant", content: content.into() }
+    }
 }
 
 #[derive(Debug, Serialize)]
