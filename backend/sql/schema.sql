@@ -113,3 +113,40 @@ CREATE TABLE ai_interactions (
 CREATE INDEX idx_ai_interactions_user_id ON ai_interactions (user_id);
 CREATE INDEX idx_ai_interactions_type ON ai_interactions (interaction_type);
 CREATE INDEX idx_ai_interactions_created_at ON ai_interactions (created_at);
+
+-- ---------------------------------------------------------------------------
+-- Table: socratic_sessions
+-- One row per Socratic dialogue session. A session is scoped to a study_set
+-- (the student is exploring/being questioned on that set's topic as a whole,
+-- not a single card). Added by migration 0002_add_socratic_tables.sql.
+-- ---------------------------------------------------------------------------
+CREATE TABLE socratic_sessions (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    set_id      UUID NOT NULL REFERENCES study_sets(id) ON DELETE CASCADE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_socratic_sessions_user_id ON socratic_sessions (user_id);
+CREATE INDEX idx_socratic_sessions_set_id ON socratic_sessions (set_id);
+
+-- ---------------------------------------------------------------------------
+-- Table: socratic_messages
+-- Individual turns within a session, ordered by created_at. 'role' distinguishes
+-- the student's messages from the AI tutor's. 'flagged_misconception' is
+-- populated ONLY on assistant-role rows where the AI detected a specific
+-- misconception in the student's preceding message; NULL otherwise (including
+-- on all user-role rows, and on assistant-role rows where no misconception was
+-- detected). Added by migration 0002_add_socratic_tables.sql.
+-- ---------------------------------------------------------------------------
+CREATE TABLE socratic_messages (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id              UUID NOT NULL REFERENCES socratic_sessions(id) ON DELETE CASCADE,
+    role                    TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    content                 TEXT NOT NULL,
+    flagged_misconception   TEXT,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_socratic_messages_session_id ON socratic_messages (session_id);
+CREATE INDEX idx_socratic_messages_session_created ON socratic_messages (session_id, created_at);
