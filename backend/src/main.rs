@@ -2,6 +2,7 @@ use actix_web::{get, web, App, HttpServer, HttpResponse};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 
+use actix_cors::Cors;
 use mnemosyne_core::scheduling::FsrsScheduler;
 
 mod deepseek;
@@ -81,7 +82,17 @@ async fn main() -> std::io::Result<()> {
     let deepseek = web::Data::new(deepseek_client);
 
     HttpServer::new(move || {
+        // FIXME: permissive CORS for local development only — tighten before
+        // any deployment (restrict allowed origins to the specific trunk dev
+        // server port, not a wildcard). Same category of known simplification
+        // as the auth debt noted in Prompt 2.
+        let cors = Cors::default()
+            .allow_any_origin()
+            .allow_any_method()
+            .allow_any_header();
+
         App::new()
+            .wrap(cors)
             .app_data(web::Data::new(pool.clone()))
             .app_data(scheduler.clone())
             .app_data(deepseek.clone())

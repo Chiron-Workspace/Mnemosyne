@@ -1,0 +1,3 @@
+[serve]
+# Port 8080 is occupied by SearXNG, 8081 by our backend — use 8082.
+port = 8082

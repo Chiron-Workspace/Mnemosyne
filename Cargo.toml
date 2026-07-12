@@ -1,5 +1,5 @@
 [workspace]
-members = ["mnemosyne-core", "backend"]
+members = ["mnemosyne-core", "backend", "frontend"]
 resolver = "2"
 
 [workspace.package]
