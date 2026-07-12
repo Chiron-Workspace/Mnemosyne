@@ -6,6 +6,7 @@
 
 pub mod cards;
 pub mod due;
+pub mod feynman;
 pub mod generate;
 pub mod reviews;
 pub mod socratic;
