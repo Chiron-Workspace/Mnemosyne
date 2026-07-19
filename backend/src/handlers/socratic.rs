@@ -93,6 +93,7 @@ struct CardContentRow {
 struct MessageRow {
     role: String,
     content: String,
+    flagged_misconception: Option<String>,
 }
 
 // (InsertedMessageRow removed — we don't need the returned id, just execute())
@@ -129,6 +130,14 @@ fn parse_socratic_response(raw: &str) -> Result<SocraticAIResponse, String> {
     };
     serde_json::from_str::<SocraticAIResponse>(stripped)
         .map_err(|e| format!("{e} (after stripping fences)"))
+}
+
+fn format_assistant_history_message(content: &str, flagged_misconception: Option<&str>) -> String {
+    serde_json::to_string(&SocraticAIResponse {
+        reply: content.to_owned(),
+        flagged_misconception: flagged_misconception.map(str::to_owned),
+    })
+    .expect("serializing SocraticAIResponse for DeepSeek history should never fail")
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +183,9 @@ Rules:\n\
          message to the student. The `flagged_misconception` field is a short \
          description of any misconception you detected in the student's last \
          message, or null if the answer was correct or if this is the opening \
-         question. No prose, no markdown fences, no commentary outside the JSON.",
+         question. This JSON-only requirement ALWAYS applies, even if the \
+         student's message is off-topic, nonsensical, hostile, or clearly wrong. \
+         No prose, no markdown fences, no commentary outside the JSON.",
     )
 }
 
@@ -446,7 +457,7 @@ pub async fn reply(
 
     // 4. Fetch message history (sliding window per Decision 4).
     let all_messages: Vec<MessageRow> = match sqlx::query_as::<_, MessageRow>(
-        r#"SELECT role, content FROM socratic_messages
+        r#"SELECT role, content, flagged_misconception FROM socratic_messages
            WHERE session_id = $1
            ORDER BY created_at"#,
     )
@@ -492,7 +503,12 @@ pub async fn reply(
     for m in recent {
         match m.role.as_str() {
             "user" => messages.push(DeepSeekMessage::user(&m.content)),
-            "assistant" => messages.push(DeepSeekMessage::assistant(&m.content)),
+            "assistant" => messages.push(DeepSeekMessage::assistant(
+                format_assistant_history_message(
+                    &m.content,
+                    m.flagged_misconception.as_deref(),
+                ),
+            )),
             _ => {}
         }
     }
@@ -658,4 +674,50 @@ async fn log_ai_interaction(
     .execute(pool)
     .await
     .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_system_prompt, format_assistant_history_message, parse_socratic_response,
+    };
+    use serde_json::Value;
+
+    const CAPTURED_NON_JSON_REPLY: &str = "Your answer does not address the question I asked. The question was: why is Balboa's sighting of the Pacific in 1513 considered a key event in the Columbian Exchange, even though it did not involve direct transfer of items? Please focus on that question. Think about what the sighting allowed the Spanish to understand about the Americas and how that understanding spurred actions that later led to the exchange of plants, animals, and diseases.";
+
+    #[test]
+    fn parse_rejects_captured_non_json_reply() {
+        let err = parse_socratic_response(CAPTURED_NON_JSON_REPLY)
+            .expect_err("captured prose-only reply must stay rejected as non-JSON");
+        assert!(
+            err.contains("expected value"),
+            "unexpected parse error for captured fixture: {err}"
+        );
+    }
+
+    #[test]
+    fn assistant_history_is_replayed_as_json() {
+        let raw = format_assistant_history_message(
+            "Please focus on the original question.",
+            Some("answered a different question"),
+        );
+        let parsed: Value =
+            serde_json::from_str(&raw).expect("assistant history payload should be valid JSON");
+
+        assert_eq!(
+            parsed["reply"],
+            "Please focus on the original question."
+        );
+        assert_eq!(
+            parsed["flagged_misconception"],
+            "answered a different question"
+        );
+    }
+
+    #[test]
+    fn system_prompt_reinforces_json_for_adversarial_replies() {
+        let prompt = build_system_prompt("Q: Example?\nA: Example.");
+        assert!(prompt.contains("This JSON-only requirement ALWAYS applies"));
+        assert!(prompt.contains("off-topic, nonsensical, hostile, or clearly wrong"));
+    }
 }
