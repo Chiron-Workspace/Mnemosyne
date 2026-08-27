@@ -12,6 +12,8 @@
 //! handlers should reuse this client rather than re-implementing HTTP.
 
 use serde::{Deserialize, Serialize};
+use crate::llm_provider::{LLMMessage, LLMResponse, LLMError, LLMProvider};
+use async_trait::async_trait;
 
 /// Default model — verified working in the M1-closeout connectivity test
 /// (`scripts/test-deepseek.sh`) and per the DeepSeek API docs (May 2026). The
@@ -23,22 +25,15 @@ const BASE_URL: &str = "https://api.deepseek.com";
 
 /// A chat message in the OpenAI/DeepSeek wire format. Either role can be
 /// serialized by the client; callers normally send `system` + `user`.
+///
+/// Note: Handlers build messages via [`crate::llm_provider::LLMMessage`] and the
+/// provider adapter converts to this struct at the wire boundary. No direct
+/// constructor is exposed — construct one with struct literal syntax if you
+/// need a raw DeepSeekMessage for debugging/low-level tests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeepSeekMessage {
     pub role: &'static str,
     pub content: String,
-}
-
-impl DeepSeekMessage {
-    pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system", content: content.into() }
-    }
-    pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user", content: content.into() }
-    }
-    pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: "assistant", content: content.into() }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -170,5 +165,138 @@ impl DeepSeekClient {
 
         serde_json::from_str::<DeepSeekResponse>(&body)
             .map_err(|e| DeepSeekError::Parse(format!("{e}; body snippet: {}", body.chars().take(500).collect::<String>())))
+    }
+}
+
+#[async_trait]
+impl LLMProvider for DeepSeekClient {
+    async fn chat_completion(
+        &self,
+        messages: &[LLMMessage],
+        model: Option<&str>,
+    ) -> Result<LLMResponse, LLMError> {
+        let ds_messages: Vec<DeepSeekMessage> = messages
+            .iter()
+            .map(|m| DeepSeekMessage {
+                role: m.role,
+                content: m.content.clone(),
+            })
+            .collect();
+
+        let resp = self
+            .chat_completion(&ds_messages, model)
+            .await
+            .map_err(|e| match e {
+                DeepSeekError::Network(m) => LLMError::Network(m),
+                DeepSeekError::Http { status, body } => LLMError::Http { status, body },
+                DeepSeekError::Parse(m) => LLMError::Parse(m),
+            })?;
+
+        let content = resp
+            .choices
+            .first()
+            .map(|c| c.message.content.clone())
+            .unwrap_or_default();
+
+        Ok(LLMResponse {
+            content,
+            total_tokens: resp.usage.total_tokens,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm_provider::LLMMessage;
+
+    #[test]
+    fn llm_message_to_deepseek_message_preserves_role_and_content() {
+        let llm_messages = vec![
+            LLMMessage::system("you are helpful"),
+            LLMMessage::user("hello"),
+            LLMMessage::assistant("hi there"),
+        ];
+        let ds_messages: Vec<DeepSeekMessage> = llm_messages
+            .iter()
+            .map(|m| DeepSeekMessage {
+                role: m.role,
+                content: m.content.clone(),
+            })
+            .collect();
+
+        assert_eq!(ds_messages.len(), 3);
+        assert_eq!(ds_messages[0].role, "system");
+        assert_eq!(ds_messages[0].content, "you are helpful");
+        assert_eq!(ds_messages[1].role, "user");
+        assert_eq!(ds_messages[1].content, "hello");
+        assert_eq!(ds_messages[2].role, "assistant");
+        assert_eq!(ds_messages[2].content, "hi there");
+    }
+
+    #[test]
+    fn llm_response_extracts_first_choice_and_total_tokens() {
+        let json = r#"{
+            "choices": [
+                {"message": {"role": "assistant", "content": "the reply"}},
+                {"message": {"role": "assistant", "content": "second choice ignored"}}
+            ],
+            "usage": {"total_tokens": 42, "prompt_tokens": 10, "completion_tokens": 32}
+        }"#;
+        let resp: DeepSeekResponse = serde_json::from_str(json).unwrap();
+
+        let content = resp
+            .choices
+            .first()
+            .map(|c| c.message.content.clone())
+            .unwrap_or_default();
+
+        assert_eq!(content, "the reply");
+        assert_eq!(resp.usage.total_tokens, 42);
+    }
+
+    #[test]
+    fn llm_response_handles_empty_choices_gracefully() {
+        let json = r#"{
+            "choices": [],
+            "usage": {"total_tokens": 5}
+        }"#;
+        let resp: DeepSeekResponse = serde_json::from_str(json).unwrap();
+
+        let content = resp
+            .choices
+            .first()
+            .map(|c| c.message.content.clone())
+            .unwrap_or_default();
+
+        assert_eq!(content, "");
+        assert_eq!(resp.usage.total_tokens, 5);
+    }
+
+    #[test]
+    fn deepseek_error_maps_to_llm_error_variants() {
+        let ds_net = DeepSeekError::Network("timeout".into());
+        let llm_net = match ds_net {
+            DeepSeekError::Network(m) => LLMError::Network(m),
+            DeepSeekError::Http { status, body } => LLMError::Http { status, body },
+            DeepSeekError::Parse(m) => LLMError::Parse(m),
+        };
+        assert!(matches!(llm_net, LLMError::Network(s) if s == "timeout"));
+
+        let ds_http = DeepSeekError::Http { status: 429, body: "rate limited".into() };
+        let llm_http = match ds_http {
+            DeepSeekError::Network(m) => LLMError::Network(m),
+            DeepSeekError::Http { status, body } => LLMError::Http { status, body },
+            DeepSeekError::Parse(m) => LLMError::Parse(m),
+        };
+        assert!(matches!(llm_http, LLMError::Http { status: 429, .. }));
+
+        let ds_parse = DeepSeekError::Parse("bad json".into());
+        let llm_parse = match ds_parse {
+            DeepSeekError::Network(m) => LLMError::Network(m),
+            DeepSeekError::Http { status, body } => LLMError::Http { status, body },
+            DeepSeekError::Parse(m) => LLMError::Parse(m),
+        };
+        assert!(matches!(llm_parse, LLMError::Parse(s) if s == "bad json"));
     }
 }

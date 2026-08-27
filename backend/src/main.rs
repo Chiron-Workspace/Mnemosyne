@@ -6,6 +6,7 @@ use actix_cors::Cors;
 use mnemosyne_core::scheduling::FsrsScheduler;
 
 mod deepseek;
+mod llm_provider;
 mod handlers;
 
 #[get("/health")]
@@ -72,14 +73,21 @@ async fn main() -> std::io::Result<()> {
     // web::Data (which is Arc internally; no Clone needed on the scheduler).
     let scheduler = web::Data::new(FsrsScheduler::default());
 
-    // Construct the DeepSeek HTTP client once and share it the same way. Fails
-    // fast at startup if the API key is missing — silent absence of an AI
-    // subsystem is worse than a clear panic.
-    let deepseek_client = deepseek::DeepSeekClient::from_env().unwrap_or_else(|| {
-        panic!("DEEPSEEK_API_KEY is not set in .env. Add it (see .env.example).");
-    });
-    eprintln!("[mnemosyne] DeepSeek client ready");
-    let deepseek = web::Data::new(deepseek_client);
+    // Construct the LLM provider via env-configured selection. Defaults to
+    // "deepseek" to preserve the pre-refactor startup behavior. Fails fast at
+    // startup if the selected provider's required API key is missing — silent
+    // absence of an AI subsystem is worse than a clear panic.
+    let provider_name = std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "deepseek".to_string());
+    let llm_provider: Box<dyn llm_provider::LLMProvider> = match provider_name.as_str() {
+        "deepseek" => Box::new(
+            deepseek::DeepSeekClient::from_env().unwrap_or_else(|| {
+                panic!("DEEPSEEK_API_KEY is not set in .env. Add it (see .env.example).");
+            })
+        ),
+        other => panic!("Unknown LLM_PROVIDER: {other}"),
+    };
+    eprintln!("[mnemosyne] LLM provider ready ({provider_name})");
+    let llm_provider = web::Data::new(llm_provider);
 
     HttpServer::new(move || {
         // FIXME: permissive CORS for local development only — tighten before
@@ -95,7 +103,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(cors)
             .app_data(web::Data::new(pool.clone()))
             .app_data(scheduler.clone())
-            .app_data(deepseek.clone())
+            .app_data(llm_provider.clone())
             .service(health)
             .service(health_db)
             .service(handlers::users::create_user)

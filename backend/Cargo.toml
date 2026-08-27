@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 actix-cors = "0.7.1"
 actix-web = "4.14.0"
+async-trait = "0.1.81"
 chrono = { version = "0.4.45", default-features = false, features = ["serde", "clock", "std"] }
 dotenvy = "0.15.7"
 mnemosyne-core = { path = "../mnemosyne-core" }

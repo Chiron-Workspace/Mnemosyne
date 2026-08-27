@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use crate::deepseek::{DeepSeekClient, DeepSeekMessage, DEFAULT_MODEL};
+use crate::llm_provider::{LLMProvider, LLMMessage};
 use super::error_response;
 
 /// Cap on total card content (Q+A text) included in the system prompt to
@@ -226,7 +226,7 @@ async fn fetch_card_context(pool: &PgPool, set_id: Uuid) -> Result<Option<String
 #[post("/socratic/start")]
 pub async fn start(
     pool: web::Data<PgPool>,
-    deepseek: web::Data<DeepSeekClient>,
+    llm: web::Data<Box<dyn LLMProvider>>,
     body: web::Json<StartRequest>,
 ) -> HttpResponse {
     // 1. Validate study_set exists.
@@ -305,20 +305,16 @@ pub async fn start(
     // 4. Build system prompt + a user message initiating the session.
     let system_prompt = build_system_prompt(&card_context);
     let messages = vec![
-        DeepSeekMessage::system(system_prompt.clone()),
-        DeepSeekMessage::user("Begin the session. Ask ONE opening question."),
+        LLMMessage::system(system_prompt.clone()),
+        LLMMessage::user("Begin the session. Ask ONE opening question."),
     ];
 
-    // 5. Call DeepSeek.
+    // 5. Call LLM provider.
     let prompt_log = format!("[socratic:start]\n[system] {system_prompt}\n[user] Begin the session.");
 
-    match deepseek.chat_completion(&messages, Some(DEFAULT_MODEL)).await {
+    match llm.chat_completion(&messages, None).await {
         Ok(resp) => {
-            let raw = resp
-                .choices
-                .first()
-                .map(|c| c.message.content.clone())
-                .unwrap_or_default();
+            let raw = resp.content;
 
             // 6. Parse structured JSON.
             let parsed = match parse_socratic_response(&raw) {
@@ -329,7 +325,7 @@ pub async fn start(
                         body.user_id,
                         &prompt_log,
                         &raw,
-                        resp.usage.total_tokens,
+                        resp.total_tokens,
                     )
                     .await;
                     return error_response(
@@ -358,7 +354,7 @@ pub async fn start(
                 body.user_id,
                 &prompt_log,
                 &raw,
-                resp.usage.total_tokens,
+                resp.total_tokens,
             )
             .await;
 
@@ -390,7 +386,7 @@ pub async fn start(
 #[post("/socratic/{session_id}/reply")]
 pub async fn reply(
     pool: web::Data<PgPool>,
-    deepseek: web::Data<DeepSeekClient>,
+    llm: web::Data<Box<dyn LLMProvider>>,
     path: web::Path<Uuid>,
     body: web::Json<ReplyRequest>,
 ) -> HttpResponse {
@@ -499,11 +495,11 @@ pub async fn reply(
 
     // 6. Build message vec: system + recent history.
     let system_prompt = build_system_prompt(&card_context);
-    let mut messages = vec![DeepSeekMessage::system(system_prompt.clone())];
+    let mut messages = vec![LLMMessage::system(system_prompt.clone())];
     for m in recent {
         match m.role.as_str() {
-            "user" => messages.push(DeepSeekMessage::user(&m.content)),
-            "assistant" => messages.push(DeepSeekMessage::assistant(
+            "user" => messages.push(LLMMessage::user(&m.content)),
+            "assistant" => messages.push(LLMMessage::assistant(
                 format_assistant_history_message(
                     &m.content,
                     m.flagged_misconception.as_deref(),
@@ -513,19 +509,15 @@ pub async fn reply(
         }
     }
 
-    // 7. Call DeepSeek.
+    // 7. Call LLM provider.
     let prompt_log = format!(
         "[socratic:reply]\n[system] {system_prompt}\n[{} messages in context window]",
         recent.len()
     );
 
-    match deepseek.chat_completion(&messages, Some(DEFAULT_MODEL)).await {
+    match llm.chat_completion(&messages, None).await {
         Ok(resp) => {
-            let raw = resp
-                .choices
-                .first()
-                .map(|c| c.message.content.clone())
-                .unwrap_or_default();
+            let raw = resp.content;
 
             let parsed = match parse_socratic_response(&raw) {
                 Ok(p) => p,
@@ -535,7 +527,7 @@ pub async fn reply(
                         session.user_id,
                         &prompt_log,
                         &raw,
-                        resp.usage.total_tokens,
+                        resp.total_tokens,
                     )
                     .await;
                     return error_response(
@@ -564,7 +556,7 @@ pub async fn reply(
                 session.user_id,
                 &prompt_log,
                 &raw,
-                resp.usage.total_tokens,
+                resp.total_tokens,
             )
             .await;
 

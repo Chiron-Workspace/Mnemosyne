@@ -10,7 +10,7 @@ use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 
-use crate::deepseek::{DeepSeekClient, DeepSeekMessage, DEFAULT_MODEL};
+use crate::llm_provider::{LLMProvider, LLMMessage};
 use super::error_response;
 
 /// Hard cap on source text length to keep token cost predictable and bounded.
@@ -71,7 +71,7 @@ struct GenerateCardsResponse {
 #[post("/study_sets/{set_id}/generate_cards")]
 pub async fn generate_cards(
     pool: web::Data<PgPool>,
-    deepseek: web::Data<DeepSeekClient>,
+    llm: web::Data<Box<dyn LLMProvider>>,
     path: web::Path<Uuid>,
     body: web::Json<GenerateCardsRequest>,
 ) -> HttpResponse {
@@ -157,8 +157,8 @@ pub async fn generate_cards(
     };
 
     let messages = vec![
-        DeepSeekMessage::system(system_prompt.clone()),
-        DeepSeekMessage::user(user_prompt.clone()),
+        LLMMessage::system(system_prompt.clone()),
+        LLMMessage::user(user_prompt.clone()),
     ];
 
     // We always log the ai_interactions row, in success OR failure. The
@@ -168,17 +168,12 @@ pub async fn generate_cards(
     // schema column.
     let prompt_log = format!("[style: {style}]\n[system] {system_prompt}\n[user] {user_prompt}");
 
-    // 5. Call DeepSeek.
-    let outcome: Result<crate::deepseek::DeepSeekResponse, crate::deepseek::DeepSeekError> =
-        deepseek.chat_completion(&messages, Some(DEFAULT_MODEL)).await;
+    // 5. Call LLM provider.
+    let outcome = llm.chat_completion(&messages, None).await;
 
     match outcome {
         Ok(resp) => {
-            let raw = resp
-                .choices
-                .first()
-                .map(|c| c.message.content.clone())
-                .unwrap_or_default();
+            let raw = resp.content;
 
             // 6. Defensive parse: try the raw text, then strip a leading
             //    ```json fence if present.
@@ -192,7 +187,7 @@ pub async fn generate_cards(
                         owner.user_id,
                         &prompt_log,
                         &raw,
-                        resp.usage.total_tokens,
+                        resp.total_tokens,
                     )
                     .await;
                     return error_response(
@@ -213,7 +208,7 @@ pub async fn generate_cards(
                         owner.user_id,
                         &prompt_log,
                         &raw,
-                        resp.usage.total_tokens,
+                        resp.total_tokens,
                     )
                     .await;
                     return error_response(
@@ -233,7 +228,7 @@ pub async fn generate_cards(
                     owner.user_id,
                     &prompt_log,
                     &raw,
-                    resp.usage.total_tokens,
+                    resp.total_tokens,
                 )
                 .await;
                 return error_response(
@@ -271,7 +266,7 @@ pub async fn generate_cards(
                             owner.user_id,
                             &prompt_log,
                             &raw,
-                            resp.usage.total_tokens,
+                            resp.total_tokens,
                         )
                         .await;
                         return error_response(
@@ -292,7 +287,7 @@ pub async fn generate_cards(
                 owner.user_id,
                 &prompt_log,
                 &raw,
-                resp.usage.total_tokens,
+                resp.total_tokens,
             )
             .await;
 
@@ -300,7 +295,7 @@ pub async fn generate_cards(
             //    transparency.
             HttpResponse::Created().json(GenerateCardsResponse {
                 cards: created,
-                tokens_used: resp.usage.total_tokens,
+                tokens_used: resp.total_tokens,
             })
         }
         Err(api_err) => {

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use crate::deepseek::{DeepSeekClient, DeepSeekMessage, DEFAULT_MODEL};
+use crate::llm_provider::{LLMProvider, LLMMessage};
 use super::error_response;
 
 /// Cap on total card content included in the evaluation prompt.
@@ -189,7 +189,7 @@ fn build_system_prompt(card_context: &str) -> String {
 #[post("/study_sets/{set_id}/feynman_evaluate")]
 pub async fn evaluate(
     pool: web::Data<PgPool>,
-    deepseek: web::Data<DeepSeekClient>,
+    llm: web::Data<Box<dyn LLMProvider>>,
     path: web::Path<Uuid>,
     body: web::Json<FeynmanEvaluateRequest>,
 ) -> HttpResponse {
@@ -257,20 +257,16 @@ pub async fn evaluate(
         "Student's explanation:\n\n{trimmed}\n\nEvaluate this explanation."
     );
     let messages = vec![
-        DeepSeekMessage::system(system_prompt.clone()),
-        DeepSeekMessage::user(user_prompt.clone()),
+        LLMMessage::system(system_prompt.clone()),
+        LLMMessage::user(user_prompt.clone()),
     ];
     let prompt_log =
         format!("[feynman:evaluate]\n[system] {system_prompt}\n[user] {user_prompt}");
 
-    // 5. Call DeepSeek.
-    match deepseek.chat_completion(&messages, Some(DEFAULT_MODEL)).await {
+    // 5. Call LLM provider.
+    match llm.chat_completion(&messages, None).await {
         Ok(resp) => {
-            let raw = resp
-                .choices
-                .first()
-                .map(|c| c.message.content.clone())
-                .unwrap_or_default();
+            let raw = resp.content;
 
             // 6. Parse structured JSON.
             let parsed = match parse_feynman_response(&raw) {
@@ -281,7 +277,7 @@ pub async fn evaluate(
                         body.user_id,
                         &prompt_log,
                         &raw,
-                        resp.usage.total_tokens,
+                        resp.total_tokens,
                     )
                     .await;
                     return error_response(
@@ -312,7 +308,7 @@ pub async fn evaluate(
                     body.user_id,
                     &prompt_log,
                     &raw,
-                    resp.usage.total_tokens,
+                    resp.total_tokens,
                 )
                 .await;
                 return error_response(
@@ -349,7 +345,7 @@ pub async fn evaluate(
                         body.user_id,
                         &prompt_log,
                         &raw,
-                        resp.usage.total_tokens,
+                        resp.total_tokens,
                     )
                     .await;
                     return error_response(
@@ -365,7 +361,7 @@ pub async fn evaluate(
                 body.user_id,
                 &prompt_log,
                 &raw,
-                resp.usage.total_tokens,
+                resp.total_tokens,
             )
             .await;
 
