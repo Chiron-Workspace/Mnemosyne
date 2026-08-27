@@ -49,7 +49,6 @@ pub async fn create_card(
            VALUES ($1, $2, $3)
            RETURNING id, set_id, question, answer, created_at"#,
     )
-    .persistent(false)
     .bind(body.set_id)
     .bind(&body.question)
     .bind(&body.answer)
@@ -77,7 +76,6 @@ pub async fn list_cards(
                    WHERE set_id = $1
                    ORDER BY created_at"#,
             )
-            .persistent(false)
             .bind(sid)
             .fetch_all(pool.get_ref())
             .await
@@ -88,7 +86,6 @@ pub async fn list_cards(
                    FROM cards
                    ORDER BY created_at"#,
             )
-            .persistent(false)
             .fetch_all(pool.get_ref())
             .await
         }

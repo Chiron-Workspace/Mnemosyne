@@ -7,9 +7,24 @@ painful to diagnose.
 
 ---
 
-## 1. sqlx + Supabase Pooler: must use `.persistent(false)` on every query
+## 1. sqlx + Supabase Pooler: `.persistent(false)` on every query
 
-### The problem
+> **STATUS: HISTORICAL — no longer applies as of 2026-08-27.**
+>
+> Mnemosyne no longer uses Supabase. It now connects directly to the local
+> Postgres cluster shared with the Knowledge Store
+> (`chiron-ks-postgres.service`, port 55432, its own `mnemosyne` database).
+> There is no connection pooler in the path, so sqlx's default
+> prepared-statement caching is safe. Every `.persistent(false)` call and the
+> `statement_cache_capacity(0)` option have been removed from the codebase.
+>
+> This is the explicit, recorded decision that the old checklist below asked
+> for. **Do not add `.persistent(false)` to new queries.** The entry is kept
+> because the diagnosis is still correct and would apply again if a
+> transaction-mode pooler (PgBouncer, Supavisor) is ever put in front of the
+> database.
+
+### The problem (as it was)
 
 sqlx by default prepares named statements (`sqlx_s_1`, `sqlx_s_2`, ...) and
 caches them per connection. Supabase's connection pooler (Supavisor /
@@ -82,17 +97,18 @@ statements. If you are having trouble, try setting `.persistent(false)`."*
   has IPv4 and is what Supabase themselves recommend for application
   connections.
 
-### Rule going forward (checklist for future prompts touching the DB layer)
+### Rule going forward
 
-- [ ] Every new `sqlx::query*` call in this codebase MUST include
-      `.persistent(false)` between the SQL string and the first `.bind()`.
-- [ ] Code review must reject any PR that adds a `sqlx::query*` call without
-      `.persistent(false)` — this is not a style preference, it is a
-      correctness requirement against the production DB.
-- [ ] If we ever switch off the Supabase pooler (e.g., self-host Postgres
-      with direct connections, or move to Supabase's session-mode pooler on
-      a different port), this requirement can be relaxed — but that decision
-      must be made explicitly and recorded here, not silently.
+The old checklist required `.persistent(false)` on every query and said the
+requirement could be relaxed only if the pooler was switched off, by an
+explicit decision recorded here. That switch has now happened, and this is
+that record:
+
+- Mnemosyne runs against a direct Postgres connection. New `sqlx::query*`
+  calls need **no** `.persistent(false)`; write them plainly.
+- If a transaction-mode pooler is ever introduced between the backend and
+  Postgres, everything above applies again — reinstate `.persistent(false)`
+  on every query and update this status banner.
 
 ### Where this was discovered
 
@@ -106,3 +122,10 @@ statements. If you are having trouble, try setting `.persistent(false)`."*
 - **Affected files at time of fix:** `backend/src/main.rs` (the `/health/db`
   scalar query) and `backend/src/handlers/{users,study_sets,cards}.rs` (all
   six CRUD query calls).
+
+### Where this was retired
+
+- **Date:** 2026-08-27, when Mnemosyne moved off Supabase onto the local
+  Postgres cluster shared with the Knowledge Store. All 38 `.persistent(false)`
+  calls across nine files and the `statement_cache_capacity(0)` option in
+  `main.rs` were removed in that change.

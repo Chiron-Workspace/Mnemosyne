@@ -127,7 +127,6 @@ async fn fetch_card_context(pool: &PgPool, set_id: Uuid) -> Result<Option<String
     let cards: Vec<CardContentRow> = sqlx::query_as::<_, CardContentRow>(
         "SELECT question, answer FROM cards WHERE set_id = $1 ORDER BY created_at",
     )
-    .persistent(false)
     .bind(set_id)
     .fetch_all(pool)
     .await
@@ -199,7 +198,6 @@ pub async fn evaluate(
     let set_exists: bool = match sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM study_sets WHERE id = $1)",
     )
-    .persistent(false)
     .bind(set_id)
     .fetch_one(pool.get_ref())
     .await
@@ -326,7 +324,6 @@ pub async fn evaluate(
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                    RETURNING id"#,
             )
-            .persistent(false)
             .bind(body.user_id)
             .bind(set_id)
             .bind(&body.explanation_text)
@@ -409,7 +406,6 @@ pub async fn history(
            WHERE set_id = $1 AND user_id = $2
            ORDER BY created_at ASC"#,
     )
-    .persistent(false)
     .bind(set_id)
     .bind(query.user_id)
     .fetch_all(pool.get_ref())
@@ -447,7 +443,6 @@ async fn log_ai_interaction(
              (user_id, interaction_type, input_text, output_text, tokens_used)
            VALUES ($1, 'feynman_evaluation', $2, $3, $4)"#,
     )
-    .persistent(false)
     .bind(user_id)
     .bind(input_text)
     .bind(output_text)

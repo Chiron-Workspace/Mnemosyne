@@ -2,6 +2,7 @@
 //!
 //! - `POST /socratic/start`           — begin a new dialogue session
 //! - `POST /socratic/{id}/reply`      — send a student reply, get AI response
+//! - `POST /socratic/{id}/end`        — close the session, ship transcript to KS
 //! - `GET  /socratic/{id}`            — read full conversation history
 //!
 //! The Socratic method: the AI asks guiding questions, does NOT give direct
@@ -15,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
+use crate::ks_client::{KsClient, SaveTranscriptOutcome, TranscriptTurn};
 use crate::llm_provider::{LLMProvider, LLMMessage};
 use super::error_response;
 
@@ -56,6 +58,33 @@ pub struct StartResponse {
 pub struct ReplyResponse {
     pub reply: String,
     pub flagged_misconception: Option<String>,
+}
+
+/// What happened to the transcript hand-off when a session was closed.
+/// Reported back to the caller for visibility only — none of these states
+/// makes `/end` fail, because the study session is the real work and KS sync
+/// is bookkeeping alongside it.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum KsSyncStatus {
+    /// KS accepted the transcript (or already had it under this session_ref).
+    Saved { transcript_id: String },
+    /// No `KS_HTTP_TOKEN` configured — sync is switched off.
+    Disabled,
+    /// The session had no messages; there was nothing worth shipping.
+    NothingToSend,
+    /// KS answered but its own database is down. An immediate retry would not
+    /// help; the transcript can be re-sent later under the same session_ref.
+    KsDbUnavailable { error: String },
+    /// Transport or protocol failure talking to KS.
+    Failed { error: String },
+}
+
+#[derive(Debug, Serialize)]
+pub struct EndResponse {
+    pub session_id: Uuid,
+    pub message_count: usize,
+    pub knowledge_store: KsSyncStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,7 +224,6 @@ async fn fetch_card_context(pool: &PgPool, set_id: Uuid) -> Result<Option<String
     let cards: Vec<CardContentRow> = sqlx::query_as::<_, CardContentRow>(
         "SELECT question, answer FROM cards WHERE set_id = $1 ORDER BY created_at",
     )
-    .persistent(false)
     .bind(set_id)
     .fetch_all(pool)
     .await
@@ -233,7 +261,6 @@ pub async fn start(
     let set_exists: bool = match sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM study_sets WHERE id = $1)",
     )
-    .persistent(false)
     .bind(body.study_set_id)
     .fetch_one(pool.get_ref())
     .await
@@ -276,7 +303,6 @@ pub async fn start(
            VALUES ($1, $2)
            RETURNING id, user_id, set_id"#,
     )
-    .persistent(false)
     .bind(body.user_id)
     .bind(body.study_set_id)
     .fetch_one(pool.get_ref())
@@ -341,7 +367,6 @@ pub async fn start(
                      (session_id, role, content, flagged_misconception)
                    VALUES ($1, 'assistant', $2, $3)"#,
             )
-            .persistent(false)
             .bind(session_row.id)
             .bind(&parsed.reply)
             .bind(&parsed.flagged_misconception)
@@ -396,7 +421,6 @@ pub async fn reply(
     let session: Option<SessionRow> = match sqlx::query_as::<_, SessionRow>(
         "SELECT id, user_id, set_id FROM socratic_sessions WHERE id = $1",
     )
-    .persistent(false)
     .bind(session_id)
     .fetch_optional(pool.get_ref())
     .await
@@ -420,7 +444,6 @@ pub async fn reply(
     let msg_count: i64 = match sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM socratic_messages WHERE session_id = $1",
     )
-    .persistent(false)
     .bind(session_id)
     .fetch_one(pool.get_ref())
     .await
@@ -445,7 +468,6 @@ pub async fn reply(
         r#"INSERT INTO socratic_messages (session_id, role, content)
            VALUES ($1, 'user', $2)"#,
     )
-    .persistent(false)
     .bind(session_id)
     .bind(&body.message)
     .execute(pool.get_ref())
@@ -457,7 +479,6 @@ pub async fn reply(
            WHERE session_id = $1
            ORDER BY created_at"#,
     )
-    .persistent(false)
     .bind(session_id)
     .fetch_all(pool.get_ref())
     .await
@@ -543,7 +564,6 @@ pub async fn reply(
                      (session_id, role, content, flagged_misconception)
                    VALUES ($1, 'assistant', $2, $3)"#,
             )
-            .persistent(false)
             .bind(session_id)
             .bind(&parsed.reply)
             .bind(&parsed.flagged_misconception)
@@ -585,18 +605,95 @@ pub async fn reply(
     }
 }
 
-#[get("/socratic/{session_id}")]
-pub async fn get_session(
+/// Build the KS idempotency key for a Socratic session.
+///
+/// Derived from the Mnemosyne session UUID so the value is stable: a retry
+/// re-sends the identical `session_ref`, KS's `ON CONFLICT (session_ref) DO
+/// NOTHING` recognises it, and no duplicate row is created. Never mint a fresh
+/// ref on retry. The prefix also makes the origin traceable from the KS side.
+fn session_ref_for(session_id: Uuid) -> String {
+    format!("mnemosyne-session-{session_id}")
+}
+
+/// Collect a session's messages into the turn shape KS's extraction step
+/// understands, translating Mnemosyne's `assistant`/`user` roles onto the
+/// `coach`/`learner` pair. Rows with any other role are dropped rather than
+/// guessed at.
+fn transcript_turns(messages: &[MessageOut]) -> Vec<TranscriptTurn> {
+    messages
+        .iter()
+        .filter_map(|m| TranscriptTurn::from_socratic_role(&m.role, &m.content))
+        .collect()
+}
+
+/// Hand a finished session's transcript to the Knowledge Store.
+///
+/// Every failure path returns a [`KsSyncStatus`] rather than an error: the
+/// caller must never let a KS problem break the study session. The three
+/// outcomes KS can produce are kept distinct in both the log line and the
+/// returned status — "KS did not answer" and "KS answered but its DB is down"
+/// call for different responses from whoever reads the logs.
+async fn sync_transcript_to_ks(
+    ks: Option<&KsClient>,
+    session_id: Uuid,
+    messages: &[MessageOut],
+) -> KsSyncStatus {
+    let Some(ks) = ks else {
+        return KsSyncStatus::Disabled;
+    };
+
+    let turns = transcript_turns(messages);
+    if turns.is_empty() {
+        eprintln!("[ks] session {session_id} has no transcribable turns — nothing sent");
+        return KsSyncStatus::NothingToSend;
+    }
+
+    let session_ref = session_ref_for(session_id);
+    match ks.save_transcript(&session_ref, &turns).await {
+        Ok(SaveTranscriptOutcome::Saved { transcript_id }) => {
+            eprintln!(
+                "[ks] transcript saved: session_ref={session_ref} turns={} transcript_id={transcript_id}",
+                turns.len()
+            );
+            KsSyncStatus::Saved { transcript_id }
+        }
+        Ok(SaveTranscriptOutcome::KsDbUnavailable { error }) => {
+            // KS is alive, its Postgres is not. Retrying right now changes
+            // nothing, so log it plainly and let the session finish.
+            eprintln!(
+                "[ks] KS is up but its database is unavailable (session_ref={session_ref}): {error} \
+                 — transcript NOT stored; re-send later under the same session_ref"
+            );
+            KsSyncStatus::KsDbUnavailable { error }
+        }
+        Err(e) => {
+            eprintln!("[ks] transcript sync failed (session_ref={session_ref}): {e}");
+            KsSyncStatus::Failed { error: e.to_string() }
+        }
+    }
+}
+
+/// Close a Socratic session and ship its full transcript to the Knowledge
+/// Store.
+///
+/// This is the *only* point at which Mnemosyne talks to KS about a dialogue.
+/// Sending per-reply would be wrong by design: a KS node is a concept, not a
+/// conversational turn, so KS wants the whole finished session at once.
+///
+/// The endpoint is safe to call more than once — `session_ref` is the
+/// idempotency key on the KS side, so a repeat call returns the original
+/// `transcript_id` instead of duplicating the record.
+#[post("/socratic/{session_id}/end")]
+pub async fn end(
     pool: web::Data<PgPool>,
+    ks: web::Data<Option<KsClient>>,
     path: web::Path<Uuid>,
 ) -> HttpResponse {
     let session_id = path.into_inner();
 
-    // Validate session exists.
     let exists: bool = match sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM socratic_sessions WHERE id = $1)",
     )
-    .persistent(false)
     .bind(session_id)
     .fetch_one(pool.get_ref())
     .await
@@ -622,7 +719,65 @@ pub async fn get_session(
            WHERE session_id = $1
            ORDER BY created_at"#,
     )
-    .persistent(false)
+    .bind(session_id)
+    .fetch_all(pool.get_ref())
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("database error fetching transcript: {e}"),
+            );
+        }
+    };
+
+    let knowledge_store =
+        sync_transcript_to_ks(ks.get_ref().as_ref(), session_id, &messages).await;
+
+    HttpResponse::Ok().json(EndResponse {
+        session_id,
+        message_count: messages.len(),
+        knowledge_store,
+    })
+}
+
+#[get("/socratic/{session_id}")]
+pub async fn get_session(
+    pool: web::Data<PgPool>,
+    path: web::Path<Uuid>,
+) -> HttpResponse {
+    let session_id = path.into_inner();
+
+    // Validate session exists.
+    let exists: bool = match sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM socratic_sessions WHERE id = $1)",
+    )
+    .bind(session_id)
+    .fetch_one(pool.get_ref())
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            return error_response(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("database error: {e}"),
+            );
+        }
+    };
+    if !exists {
+        return error_response(
+            actix_web::http::StatusCode::NOT_FOUND,
+            format!("socratic session {} not found", session_id),
+        );
+    }
+
+    let messages: Vec<MessageOut> = match sqlx::query_as::<_, MessageOut>(
+        r#"SELECT role, content, flagged_misconception, created_at
+           FROM socratic_messages
+           WHERE session_id = $1
+           ORDER BY created_at"#,
+    )
     .bind(session_id)
     .fetch_all(pool.get_ref())
     .await
@@ -658,7 +813,6 @@ async fn log_ai_interaction(
              (user_id, interaction_type, input_text, output_text, tokens_used)
            VALUES ($1, 'socratic_dialogue', $2, $3, $4)"#,
     )
-    .persistent(false)
     .bind(user_id)
     .bind(input_text)
     .bind(output_text)
@@ -672,8 +826,21 @@ async fn log_ai_interaction(
 mod tests {
     use super::{
         build_system_prompt, format_assistant_history_message, parse_socratic_response,
+        session_ref_for, transcript_turns, KsSyncStatus, MessageOut,
     };
+    use crate::ks_client::TranscriptTurn;
+    use chrono::Utc;
     use serde_json::Value;
+    use uuid::Uuid;
+
+    fn msg(role: &str, content: &str) -> MessageOut {
+        MessageOut {
+            role: role.to_string(),
+            content: content.to_string(),
+            flagged_misconception: None,
+            created_at: Utc::now(),
+        }
+    }
 
     const CAPTURED_NON_JSON_REPLY: &str = "Your answer does not address the question I asked. The question was: why is Balboa's sighting of the Pacific in 1513 considered a key event in the Columbian Exchange, even though it did not involve direct transfer of items? Please focus on that question. Think about what the sighting allowed the Spanish to understand about the Americas and how that understanding spurred actions that later led to the exchange of plants, animals, and diseases.";
 
@@ -711,5 +878,66 @@ mod tests {
         let prompt = build_system_prompt("Q: Example?\nA: Example.");
         assert!(prompt.contains("This JSON-only requirement ALWAYS applies"));
         assert!(prompt.contains("off-topic, nonsensical, hostile, or clearly wrong"));
+    }
+
+    #[test]
+    fn session_ref_is_derived_from_the_session_uuid() {
+        let id = Uuid::parse_str("8f21ac00-0000-4000-8000-000000000000").unwrap();
+        // Stable and prefixed so KS can trace it back to Mnemosyne, and so a
+        // retry re-sends an identical idempotency key.
+        assert_eq!(
+            session_ref_for(id),
+            "mnemosyne-session-8f21ac00-0000-4000-8000-000000000000"
+        );
+        assert_eq!(session_ref_for(id), session_ref_for(id));
+    }
+
+    #[test]
+    fn transcript_turns_translate_roles_and_preserve_order() {
+        let messages = vec![
+            msg("assistant", "Định luật Newton 2 phát biểu thế nào?"),
+            msg("user", "Gia tốc tỉ lệ thuận với lực, F = ma."),
+        ];
+        assert_eq!(
+            transcript_turns(&messages),
+            vec![
+                TranscriptTurn::coach("Định luật Newton 2 phát biểu thế nào?"),
+                TranscriptTurn::learner("Gia tốc tỉ lệ thuận với lực, F = ma."),
+            ]
+        );
+    }
+
+    #[test]
+    fn transcript_turns_drop_unknown_roles() {
+        assert!(transcript_turns(&[msg("system", "internal note")]).is_empty());
+    }
+
+    #[test]
+    fn ks_sync_status_serializes_as_a_tagged_state() {
+        let saved = serde_json::to_value(KsSyncStatus::Saved {
+            transcript_id: "298178c8".into(),
+        })
+        .unwrap();
+        assert_eq!(saved["state"], "saved");
+        assert_eq!(saved["transcript_id"], "298178c8");
+
+        // The two failure modes must stay distinguishable to whoever reads
+        // this response: "KS did not answer" vs "KS answered, its DB is down".
+        let db_down = serde_json::to_value(KsSyncStatus::KsDbUnavailable {
+            error: "connection refused".into(),
+        })
+        .unwrap();
+        assert_eq!(db_down["state"], "ks_db_unavailable");
+
+        let failed = serde_json::to_value(KsSyncStatus::Failed {
+            error: "timeout".into(),
+        })
+        .unwrap();
+        assert_eq!(failed["state"], "failed");
+
+        assert_eq!(
+            serde_json::to_value(KsSyncStatus::Disabled).unwrap()["state"],
+            "disabled"
+        );
     }
 }

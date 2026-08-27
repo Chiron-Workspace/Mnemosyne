@@ -10,7 +10,3 @@
 
 # Environment secrets
 .env
-
-# Frontend (Leptos/trunk build artifacts)
-frontend/dist/
-frontend/target/

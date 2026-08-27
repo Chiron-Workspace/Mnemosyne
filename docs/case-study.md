@@ -44,7 +44,7 @@ Explaining a concept in one's own words surfaces gaps in understanding that pass
 
 ## 3. System Architecture
 
-**Stack:** Rust (Actix-web backend, Leptos frontend — planned), Supabase/PostgreSQL, the `fsrs` crate (v6.6.1), and DeepSeek's API (V4 Flash for cost-sensitive tasks, V4 Pro for more demanding reasoning during a rate-limit period).
+**Stack:** Rust (Actix-web backend), PostgreSQL, the `fsrs` crate (v6.6.1), and DeepSeek's API (V4 Flash for cost-sensitive tasks, V4 Pro for more demanding reasoning during a rate-limit period). Originally built on Supabase with a planned Leptos frontend; both were dropped in August 2026 when Mnemosyne became a backend module of the Chiron ecosystem, moving to a local Postgres cluster with the UI delegated to the Chiron OS shell.
 
 **Data model (10 tables across 3 migrations):** `users`, `study_sets`, `cards`, `learning_events` (FSRS state per review), `ai_interactions` (a generic AI-call cost/audit log), `socratic_sessions` + `socratic_messages` (multi-turn dialogue state), and `feynman_evaluations` (structured, scored self-explanation history).
 
@@ -96,8 +96,8 @@ The *pattern* of the score gap, not just its existence, is informative: complete
 
 Two infrastructure issues, while not the project's research focus, consumed meaningful debugging effort and are documented (`docs/gotchas.md`) as they are likely to recur for other developers using this stack combination:
 
-1. **Supabase direct-connection hostnames are IPv6-only** on standard projects; any development environment without IPv6 routing must use Supabase's connection pooler (IPv4-compatible) instead.
-2. **sqlx's default named prepared statements collide with Supabase's pooler in transaction mode**, producing intermittent `prepared statement already exists` errors under connection reuse. The fix (`.persistent(false)` on every query) is a known pattern for PgBouncer-style poolers but is not sqlx's default behavior, making it an easy regression for future code unless explicitly checklisted.
+1. **Supabase direct-connection hostnames are IPv6-only** on standard projects; any development environment without IPv6 routing must use Supabase's connection pooler (IPv4-compatible) instead. *(Historical: Mnemosyne no longer uses Supabase.)*
+2. **sqlx's default named prepared statements collide with Supabase's pooler in transaction mode**, producing intermittent `prepared statement already exists` errors under connection reuse. The fix (`.persistent(false)` on every query) is a known pattern for PgBouncer-style poolers but is not sqlx's default behavior, making it an easy regression for future code unless explicitly checklisted. *(Historical: with the move to a direct local Postgres connection, the workaround was removed — see `docs/gotchas.md`.)*
 
 ---
 
@@ -116,7 +116,7 @@ This third point is the project's central methodological claim: AI-assisted soft
 
 - **Sample size.** All findings above come from a 2–3 user closed alpha with a handful of adversarial test cases per feature, not a controlled study. The claims in Section 4 are about *what was observed*, not statistically validated generalizations.
 - **No long-horizon retention data yet.** FSRS's scheduling correctness over weeks/months (as opposed to the unit-tested and integration-tested short-interval behavior) depends on the underlying algorithm's own published validation, not on data this project has independently collected.
-- **Frontend not yet built at time of writing.** All verification to date has been performed via direct API calls; user-facing usability has not been evaluated.
+- **No frontend.** All verification has been performed via direct API calls; user-facing usability has not been evaluated. A frontend is out of scope for this module — UI belongs to the Chiron OS shell.
 - **Single-session testing.** The Socratic redirect fix and Feynman scoring pattern were each verified against one adversarial scenario per finding; broader robustness (different subjects, different misconception types, adversarial phrasing variety) is unverified and is a natural next research step, particularly if this system's data is used for a future publication.
 
 ---

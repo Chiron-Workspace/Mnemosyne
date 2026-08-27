@@ -44,7 +44,6 @@ pub async fn create_user(
            VALUES ($1, $2)
            RETURNING id, email, learning_style, created_at"#,
     )
-    .persistent(false)
     .bind(&body.email)
     .bind(&body.learning_style)
     .fetch_one(pool.get_ref())
@@ -63,7 +62,6 @@ pub async fn list_users(pool: web::Data<PgPool>) -> HttpResponse {
     match sqlx::query_as::<_, UserRow>(
         r#"SELECT id, email, learning_style, created_at FROM users ORDER BY created_at"#,
     )
-    .persistent(false)
     .fetch_all(pool.get_ref())
     .await
     {

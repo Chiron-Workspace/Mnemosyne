@@ -1,13 +1,13 @@
 use actix_web::{get, web, App, HttpServer, HttpResponse};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
-use actix_cors::Cors;
 use mnemosyne_core::scheduling::FsrsScheduler;
 
 mod deepseek;
-mod llm_provider;
 mod handlers;
+mod ks_client;
+mod llm_provider;
 
 #[get("/health")]
 async fn health() -> &'static str {
@@ -15,12 +15,11 @@ async fn health() -> &'static str {
 }
 
 /// Database health check: runs a real query (`SELECT COUNT(*) FROM users`)
-/// against Supabase and reports the result. Returns 200 with the count on
+/// against Postgres and reports the result. Returns 200 with the count on
 /// success, 500 with the error message on failure.
 #[get("/health/db")]
 async fn health_db(pool: web::Data<PgPool>) -> HttpResponse {
     match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users")
-        .persistent(false)
         .fetch_one(pool.get_ref())
         .await
     {
@@ -49,20 +48,13 @@ async fn main() -> std::io::Result<()> {
     // Create a PostgreSQL connection pool. Max 5 connections — this is a
     // 2-3 user app, no need for a large pool.
     //
-    // We use connect_with() instead of connect(&url) so we can set
-    // statement_cache_capacity(0) on PgConnectOptions. The Supabase pooler
-    // (PgBouncer in transaction mode, port 6543) does not support persistent
-    // prepared statements across transactions, and re-using a cached statement
-    // name on a different pooled backend connection raises
-    // "prepared statement \"sqlx_s_N\" already exists". Disabling the cache
-    // is the documented workaround for sqlx + PgBouncer.
-    let connect_options: PgConnectOptions = database_url
-        .parse()
-        .expect("DATABASE_URL is not a valid PostgreSQL connection string");
+    // Mnemosyne talks to the local Postgres cluster directly (no connection
+    // pooler in front of it), so sqlx's default prepared-statement caching is
+    // fine and no PgBouncer-style workaround is needed.
     eprintln!("[mnemosyne] connecting to DB...");
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        .connect_with(connect_options.statement_cache_capacity(0))
+        .connect(&database_url)
         .await
         .unwrap_or_else(|e| {
             panic!("Failed to connect to database: {e}");
@@ -89,21 +81,45 @@ async fn main() -> std::io::Result<()> {
     eprintln!("[mnemosyne] LLM provider ready ({provider_name})");
     let llm_provider = web::Data::new(llm_provider);
 
-    HttpServer::new(move || {
-        // FIXME: permissive CORS for local development only — tighten before
-        // any deployment (restrict allowed origins to the specific trunk dev
-        // server port, not a wildcard). Same category of known simplification
-        // as the auth debt noted in Prompt 2.
-        let cors = Cors::default()
-            .allow_any_origin()
-            .allow_any_method()
-            .allow_any_header();
+    // Knowledge Store client. Deliberately NOT fail-fast: unlike the LLM
+    // provider, KS is auxiliary bookkeeping, so a missing KS_HTTP_TOKEN warns
+    // once here and disables transcript sync — a study session must still run.
+    let ks_client = ks_client::KsClient::from_env();
+    match &ks_client {
+        Some(client) => {
+            eprintln!("[mnemosyne] Knowledge Store client ready");
+            // Probe /health once at startup. It needs no auth, so its result
+            // separates the two failure modes that otherwise look alike later:
+            // a failure here means the KS process is down, whereas a healthy
+            // probe followed by a 403 on /transcripts means the token is wrong.
+            // Purely diagnostic — a down KS never blocks startup.
+            match client.health().await {
+                Ok(()) => eprintln!("[mnemosyne] Knowledge Store /health: ok"),
+                Err(e) => eprintln!(
+                    "[mnemosyne] WARNING: Knowledge Store /health probe failed: {e} \
+                     — transcript sync will be attempted anyway and logged per session."
+                ),
+            }
+        }
+        None => eprintln!(
+            "[mnemosyne] WARNING: KS_HTTP_TOKEN is not set — transcript sync to the \
+             Knowledge Store is DISABLED. Study sessions are unaffected. \
+             Set KS_HTTP_TOKEN in .env to enable it (see .env.example)."
+        ),
+    }
+    let ks_client = web::Data::new(ks_client);
 
+    // No CORS layer: this API has no browser-based consumer. Sessions are
+    // driven by direct HTTP calls (coding agents, curl), and CORS only
+    // constrains requests originating from a web page. If a Chiron OS shell
+    // ever calls this backend from a browser, add actix-cors back and
+    // configure it against that shell's actual origin rather than a wildcard.
+    HttpServer::new(move || {
         App::new()
-            .wrap(cors)
             .app_data(web::Data::new(pool.clone()))
             .app_data(scheduler.clone())
             .app_data(llm_provider.clone())
+            .app_data(ks_client.clone())
             .service(health)
             .service(health_db)
             .service(handlers::users::create_user)
@@ -117,6 +133,7 @@ async fn main() -> std::io::Result<()> {
             .service(handlers::due::due)
             .service(handlers::socratic::start)
             .service(handlers::socratic::reply)
+            .service(handlers::socratic::end)
             .service(handlers::socratic::get_session)
             .service(handlers::feynman::evaluate)
             .service(handlers::feynman::history)

@@ -2,11 +2,6 @@
 //! FSRS scheduler into the database. Records a review attempt for a card by
 //! a user, computes the updated FSRS scheduling state, and persists both the
 //! event and the new state to `learning_events`.
-//!
-//! ## `.persistent(false)` reminder
-//! Every `sqlx::query*` call in this module includes `.persistent(false)` —
-//! required against the Supabase transaction-mode pooler (see
-//! `docs/gotchas.md`). Do not add a query here without it.
 
 use actix_web::{post, web, HttpResponse};
 use chrono::{DateTime, Utc};
@@ -108,7 +103,6 @@ pub async fn review(
            ORDER BY created_at DESC
            LIMIT 1"#,
     )
-    .persistent(false)
     .bind(body.card_id)
     .bind(body.user_id)
     .fetch_optional(pool.get_ref())
@@ -182,7 +176,6 @@ pub async fn review(
            VALUES ($1, $2, $3, $4, $5, $6, $7)
            RETURNING id, stability, difficulty, interval, next_review_at"#,
     )
-    .persistent(false)
     .bind(body.card_id)
     .bind(body.user_id)
     .bind(is_correct)

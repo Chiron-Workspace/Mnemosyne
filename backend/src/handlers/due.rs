@@ -95,9 +95,6 @@ pub async fn due(pool: web::Data<PgPool>, query: web::Query<DueQuery>) -> HttpRe
     //    learning_events row per (card, user) pair in a single round trip;
     //    the LEFT JOIN lets cards with no events through (NULL columns),
     //    which is how we mark them as `is_new`.
-    //
-    //    `.persistent(false)` per docs/gotchas.md — Supabase pooler doesn't
-    //    support cached prepared statements.
     let rows: Vec<DueCardRow> = match sqlx::query_as::<_, DueCardRow>(
         r#"SELECT c.id AS card_id, c.set_id, c.question, c.answer,
                   le.stability, le.difficulty, le.next_review_at
@@ -115,7 +112,6 @@ pub async fn due(pool: web::Data<PgPool>, query: web::Query<DueQuery>) -> HttpRe
            ORDER BY le.next_review_at ASC NULLS FIRST
            LIMIT $2"#,
     )
-    .persistent(false)
     .bind(user_id)
     .bind(limit)
     .fetch_all(pool.get_ref())

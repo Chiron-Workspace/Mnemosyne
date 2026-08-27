@@ -49,7 +49,6 @@ pub async fn create_study_set(
            VALUES ($1, $2, $3)
            RETURNING id, user_id, name, topic, created_at"#,
     )
-    .persistent(false)
     .bind(body.user_id)
     .bind(&body.name)
     .bind(&body.topic)
@@ -77,7 +76,6 @@ pub async fn list_study_sets(
                    WHERE user_id = $1
                    ORDER BY created_at"#,
             )
-            .persistent(false)
             .bind(uid)
             .fetch_all(pool.get_ref())
             .await
@@ -88,7 +86,6 @@ pub async fn list_study_sets(
                    FROM study_sets
                    ORDER BY created_at"#,
             )
-            .persistent(false)
             .fetch_all(pool.get_ref())
             .await
         }

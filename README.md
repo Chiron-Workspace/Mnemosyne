@@ -25,12 +25,12 @@ Most flashcard apps implement one learning principle (usually spaced repetition)
 
 ## Status
 
-Backend is feature-complete for all four methodologies and verified against a live database with real API calls. Frontend has not been built yet — all functionality below is currently exercised via direct API calls.
+Mnemosyne is a backend module of the Chiron ecosystem. It is feature-complete for all four methodologies and verified against a live database with real API calls. There is no frontend: sessions are driven through the HTTP API directly, and user-facing UI is the Chiron OS shell's responsibility.
 
 - [x] Milestone 1 — Foundation (research, architecture, FSRS algorithm selection)
 - [x] Milestone 2 — Core learning engine (FSRS scheduling wired to a live DB, AI question generation)
 - [x] Milestone 3 — Socratic Tutor + Feynman Evaluation
-- [ ] Leptos frontend
+- [x] Milestone 4 — Chiron integration (local Postgres, transcript hand-off to the Knowledge Store)
 - [ ] User authentication (currently a known, documented limitation — see below)
 
 ---
@@ -38,11 +38,10 @@ Backend is feature-complete for all four methodologies and verified against a li
 ## Tech Stack
 
 - **Backend:** Rust, [Actix-web](https://actix.rs/)
-- **Frontend (planned):** [Leptos](https://leptos.dev/) (full-stack Rust → WASM)
-- **Database:** PostgreSQL via [Supabase](https://supabase.com/), accessed with [`sqlx`](https://github.com/launchbadge/sqlx)
+- **Database:** PostgreSQL (local cluster shared with the Knowledge Store, own `mnemosyne` database), accessed with [`sqlx`](https://github.com/launchbadge/sqlx)
 - **Spaced repetition:** [`fsrs`](https://crates.io/crates/fsrs) crate (FSRS v6.6.1)
 - **LLM:** [DeepSeek](https://www.deepseek.com/) (V4 Flash for cost-sensitive generation, V4 Pro for heavier reasoning)
-- **Deployment (planned):** Vercel
+- **Knowledge Store:** local HTTP service (`chiron-ks-http.service`) receiving session transcripts
 
 ---
 
@@ -51,11 +50,11 @@ Backend is feature-complete for all four methodologies and verified against a li
 See [`docs/architecture.md`](docs/architecture.md) for a full diagram distinguishing built-and-verified components from planned ones.
 
 ```
-User → Leptos frontend (planned)
+Client (coding agent / Chiron OS shell)
            ↓ HTTP
        Actix-web backend  ──→  mnemosyne-core (FSRS scheduling wrapper)
-           ↓ sqlx                    ↓
-      Supabase PostgreSQL      DeepSeek API (question gen / Socratic / Feynman)
+           ↓ sqlx              ↓                    ↓
+   local PostgreSQL     DeepSeek API      Knowledge Store (transcripts)
 ```
 
 ---
@@ -84,7 +83,7 @@ Full request/response shapes are documented inline in each handler under `backen
 
 ### Prerequisites
 - Rust 1.90+ (`rustup update`)
-- A [Supabase](https://supabase.com/) project (free tier is sufficient)
+- A local PostgreSQL cluster — Chiron runs one via `chiron-ks-postgres.service` on port 55432
 - A [DeepSeek API](https://platform.deepseek.com/) key
 
 ### Setup
@@ -94,10 +93,14 @@ Full request/response shapes are documented inline in each handler under `backen
    cp .env.example .env
    ```
 2. Fill in `.env`:
-   - `DATABASE_URL` — your Supabase **connection pooler** URI (not the direct connection — see [`docs/gotchas.md`](docs/gotchas.md) for why), with the password percent-encoded
-   - `SUPABASE_URL`, `SUPABASE_ANON_KEY` — from your Supabase project's API settings
+   - `DATABASE_URL` — your local Postgres URI, e.g. `postgresql://postgres@127.0.0.1:55432/mnemosyne`
    - `DEEPSEEK_API_KEY` — from DeepSeek's platform
-3. Apply the database schema: run `backend/sql/schema.sql` in the Supabase SQL Editor (this includes all tables from migrations 0001–0003; a fresh setup only needs this one file, not the individual migrations).
+   - `KS_HTTP_TOKEN` — bearer token for the Knowledge Store HTTP API. Optional: leave it empty and transcript sync is skipped with a startup warning; study sessions are unaffected.
+3. Create the database and apply the schema (this one file includes all tables from migrations 0001–0003; a fresh setup does not need the individual migrations):
+   ```bash
+   psql -h 127.0.0.1 -p 55432 -U postgres -c 'CREATE DATABASE mnemosyne'
+   psql -h 127.0.0.1 -p 55432 -U postgres -d mnemosyne -f backend/sql/schema.sql
+   ```
 4. Build and run:
    ```bash
    cargo build --workspace
@@ -113,7 +116,7 @@ Full request/response shapes are documented inline in each handler under `backen
 - [`docs/spaced-rep-spike.md`](docs/spaced-rep-spike.md) — FSRS vs. SM-2 comparison
 - [`docs/adr/`](docs/adr/) — architecture decision records
 - [`docs/architecture.md`](docs/architecture.md) — system diagram
-- [`docs/gotchas.md`](docs/gotchas.md) — infrastructure issues discovered during development (Supabase pooler/IPv6, sqlx prepared-statement collisions) and their fixes
+- [`docs/gotchas.md`](docs/gotchas.md) — infrastructure issues discovered during development and their fixes (the Supabase pooler / prepared-statement entry is retained as history; it no longer applies)
 - [`docs/case-study.md`](docs/case-study.md) — full research case study, including adversarial testing of the AI features (sycophancy detection, scoring-discrimination validation)
 
 ---

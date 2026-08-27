@@ -112,7 +112,6 @@ pub async fn generate_cards(
     let owner: Option<StudySetOwnerRow> = match sqlx::query_as::<_, StudySetOwnerRow>(
         "SELECT user_id FROM study_sets WHERE id = $1",
     )
-    .persistent(false)
     .bind(set_id)
     .fetch_optional(pool.get_ref())
     .await
@@ -238,8 +237,7 @@ pub async fn generate_cards(
             }
 
             // 7. Insert each card. Use a single transaction-free batched
-            //    insert (each `INSERT` has `.persistent(false)` per docs/gotchas.md)
-            //    and collect the returned rows. Stop on first error — if the
+            //    insert and collect the returned rows. Stop on first error — if the
             //    pool blows up partway the client sees a clear 500 with the
             //    successful count surfaced in the error message.
             let mut created: Vec<CreatedCard> = Vec::with_capacity(validated.len());
@@ -249,7 +247,6 @@ pub async fn generate_cards(
                        VALUES ($1, $2, $3)
                        RETURNING id, set_id, question, answer, created_at"#,
                 )
-                .persistent(false)
                 .bind(set_id)
                 .bind(&p.question)
                 .bind(&p.answer)
@@ -422,7 +419,6 @@ async fn log_ai_interaction(
              (user_id, interaction_type, input_text, output_text, tokens_used)
            VALUES ($1, 'question_generation', $2, $3, $4)"#,
     )
-    .persistent(false)
     .bind(user_id)
     .bind(input_text)
     .bind(output_text)
