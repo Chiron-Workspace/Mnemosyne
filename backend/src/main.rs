@@ -137,6 +137,9 @@ async fn main() -> std::io::Result<()> {
             .service(handlers::socratic::get_session)
             .service(handlers::feynman::evaluate)
             .service(handlers::feynman::history)
+            .service(handlers::quiz::generate_quiz)
+            .service(handlers::quiz::attempt)
+            .service(handlers::quiz::list_questions)
     })
     .bind(("127.0.0.1", 8081))?
     .run()

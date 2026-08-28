@@ -5,11 +5,11 @@
 //! two live in different runtimes — so every interaction goes through this
 //! client.
 //!
-//! Scope is deliberately narrow: `GET /health` and `POST /transcripts`.
-//! `POST /ingest` is **not** implemented here. Per the agreed design, Mnemosyne
-//! only ever ships raw transcripts; concept extraction is KS's own job, run
-//! in-process on the Python side by a systemd timer. `/ingest` exists to serve
-//! LexiFlash later and has no consumer in Mnemosyne.
+//! Scope is deliberately narrow: `GET /health`, `POST /transcripts`, and
+//! `GET /nodes`. `POST /ingest` is **not** implemented here. Per the agreed
+//! design, Mnemosyne only ever ships raw transcripts; concept extraction is
+//! KS's own job, run in-process on the Python side by a systemd timer.
+//! `/ingest` exists to serve LexiFlash later and has no consumer in Mnemosyne.
 //!
 //! Error taxonomy mirrors the spirit of [`crate::llm_provider::LLMError`]
 //! (network / http / parse) for consistency, but is a distinct type: KS is a
@@ -156,6 +156,27 @@ impl std::error::Error for KsError {}
 // Pure helpers (unit-testable without touching the network)
 // ---------------------------------------------------------------------------
 
+/// Percent-encode one query-string value.
+///
+/// Written out rather than pulled from a crate because reqwest's `query()`
+/// helper is not available under this project's minimal feature set, and a
+/// subject filter can legitimately contain spaces and non-ASCII text
+/// ("Vật lý"), which must not be pasted into a URL raw. Only the unreserved
+/// set from RFC 3986 survives untouched; everything else, including every
+/// byte of a multi-byte UTF-8 character, is escaped.
+fn percent_encode_query_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 fn base_url_for_port(port: &str) -> String {
     format!("http://127.0.0.1:{port}")
 }
@@ -222,6 +243,50 @@ fn parse_health_response(body: &str) -> Result<(), KsError> {
             parsed.status
         )))
     }
+}
+
+/// One concept node from the Knowledge Store, as `GET /nodes` returns it.
+///
+/// Mirrors the columns of `ks.nodes` that Mnemosyne actually needs. Quiz
+/// generation reads `title` and `summary` as the source material for a
+/// question, and keeps `id` so the resulting question can be traced back to
+/// the node it came from.
+///
+/// Unknown fields are ignored rather than rejected, so KS can add columns to
+/// its own response without breaking this client.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct KsNode {
+    pub id: String,
+    pub title: String,
+    pub subject: String,
+    pub summary: String,
+}
+
+/// Envelope form of the `GET /nodes` response: `{"nodes": [...]}`.
+#[derive(Debug, Deserialize)]
+struct NodesEnvelope {
+    nodes: Vec<KsNode>,
+}
+
+/// Parse a `GET /nodes` body.
+///
+/// **The exact response shape is not yet fixed.** At the time this was
+/// written, KS exposed only `/health`, `/transcripts` and `/ingest` — the
+/// `/nodes` route did not exist, so there was no contract to code against.
+/// Rather than guess once and be wrong, this accepts the two shapes KS
+/// plausibly returns: an envelope `{"nodes": [...]}` (matching how
+/// `/transcripts` wraps its result) or a bare array `[...]`. When the real
+/// route lands, confirm which one it is and this can be narrowed.
+fn parse_nodes_response(body: &str) -> Result<Vec<KsNode>, KsError> {
+    if let Ok(envelope) = serde_json::from_str::<NodesEnvelope>(body) {
+        return Ok(envelope.nodes);
+    }
+    serde_json::from_str::<Vec<KsNode>>(body).map_err(|e| {
+        KsError::Parse(format!(
+            "{e}; expected either {{\"nodes\": [...]}} or a bare array; body snippet: {}",
+            body.chars().take(500).collect::<String>()
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +365,40 @@ impl KsClient {
         let body = resp.text().await.unwrap_or_default();
         check_status(status, &body)?;
         parse_save_response(&body)
+    }
+
+    /// `GET /nodes` — list concept nodes the learner has already studied,
+    /// optionally narrowed to one subject.
+    ///
+    /// Used as source material for quiz generation: a question is built from a
+    /// node's `title` and `summary` so the learner is tested on what they have
+    /// actually covered, rather than on free text they typed just now.
+    ///
+    /// **Not yet exercised against a live KS.** The `/nodes` route did not
+    /// exist when this was written; see [`parse_nodes_response`] for the shape
+    /// assumption this makes.
+    pub async fn get_nodes(&self, subject: Option<&str>) -> Result<Vec<KsNode>, KsError> {
+        let url = match subject {
+            Some(subject) => format!(
+                "{}/nodes?subject={}",
+                self.base_url,
+                percent_encode_query_value(subject)
+            ),
+            None => format!("{}/nodes", self.base_url),
+        };
+
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| KsError::Unreachable(e.to_string()))?;
+
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        check_status(status, &body)?;
+        parse_nodes_response(&body)
     }
 }
 
@@ -447,9 +546,68 @@ mod tests {
     // -- config --------------------------------------------------------------
 
     #[test]
+    fn query_values_are_percent_encoded() {
+        assert_eq!(percent_encode_query_value("physics"), "physics");
+        assert_eq!(percent_encode_query_value("earth science"), "earth%20science");
+        // Non-ASCII subjects are the normal case in this project, not an edge.
+        assert_eq!(percent_encode_query_value("Vật lý"), "V%E1%BA%ADt%20l%C3%BD");
+        assert_eq!(percent_encode_query_value("a&b=c"), "a%26b%3Dc");
+    }
+
+    #[test]
     fn base_url_is_localhost_only() {
         assert_eq!(base_url_for_port("8080"), "http://127.0.0.1:8080");
         assert_eq!(base_url_for_port("9999"), "http://127.0.0.1:9999");
+    }
+
+    // -- GET /nodes ----------------------------------------------------------
+
+    #[test]
+    fn parses_nodes_envelope_shape() {
+        let body = r#"{"nodes": [
+            {"id": "a64b3349-e3b6-4a19-b1bd-f024c2adc31d",
+             "title": "Định luật Newton 2",
+             "subject": "Vật lý",
+             "summary": "Gia tốc tỉ lệ thuận với lực và tỉ lệ nghịch với khối lượng."}
+        ]}"#;
+        let nodes = parse_nodes_response(body).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].title, "Định luật Newton 2");
+        assert_eq!(nodes[0].subject, "Vật lý");
+    }
+
+    #[test]
+    fn parses_nodes_bare_array_shape() {
+        // The route's contract is not fixed yet, so both shapes must work.
+        let body = r#"[
+            {"id": "1", "title": "T", "subject": "S", "summary": "Sum"}
+        ]"#;
+        let nodes = parse_nodes_response(body).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, "1");
+    }
+
+    #[test]
+    fn nodes_response_ignores_unknown_fields() {
+        // KS must be free to add columns without breaking this client.
+        let body = r#"{"nodes": [{"id": "1", "title": "T", "subject": "S",
+            "summary": "Sum", "source_module": "mnemosyne",
+            "merged_into_id": null, "created_at": "2026-08-27T00:00:00Z"}]}"#;
+        assert_eq!(parse_nodes_response(body).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn empty_nodes_list_is_not_an_error() {
+        // A learner with nothing studied yet is a normal state, not a failure.
+        assert!(parse_nodes_response(r#"{"nodes": []}"#).unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_nodes_body_is_a_parse_error() {
+        assert!(matches!(
+            parse_nodes_response("<html>404</html>"),
+            Err(KsError::Parse(_))
+        ));
     }
 
     // -- live end-to-end check ----------------------------------------------
@@ -503,6 +661,25 @@ mod tests {
                 panic!("KS is up but its database is unavailable: {error}");
             }
             Err(e) => panic!("KS call failed: {e}"),
+        }
+    }
+
+    // Separate from the transcript live check because it depends on a KS route
+    // that does not exist yet. Un-ignore only once GET /nodes is confirmed
+    // live, then verify with log correlation the same way /transcripts was.
+    #[tokio::test]
+    #[ignore = "GET /nodes does not exist in KS yet — un-ignore once the route is confirmed live"]
+    async fn live_get_nodes() {
+        dotenvy::dotenv().ok();
+        dotenvy::from_filename("../.env").ok();
+
+        let client = KsClient::from_env()
+            .expect("KS_HTTP_TOKEN must be set in .env to run this test");
+
+        let nodes = client.get_nodes(None).await.expect("GET /nodes should succeed");
+        eprintln!("[live] /nodes returned {} node(s)", nodes.len());
+        for n in nodes.iter().take(5) {
+            eprintln!("[live]   {} | {} | {}", n.id, n.subject, n.title);
         }
     }
 }
