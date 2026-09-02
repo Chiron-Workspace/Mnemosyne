@@ -23,6 +23,10 @@ pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 /// Base URL — same as the working shell-script test, no trailing slash.
 const BASE_URL: &str = "https://api.deepseek.com";
 
+/// The `finish_reason` value meaning the model ran out of token budget before
+/// finishing its answer.
+const FINISH_REASON_LENGTH: &str = "length";
+
 /// A chat message in the OpenAI/DeepSeek wire format. Either role can be
 /// serialized by the client; callers normally send `system` + `user`.
 ///
@@ -55,6 +59,15 @@ pub struct DeepSeekResponse {
 #[derive(Debug, Deserialize)]
 pub struct DeepSeekChoice {
     pub message: DeepSeekChoiceMessage,
+    /// Why generation stopped: `"stop"` normally, `"length"` when the token
+    /// budget ran out mid-answer.
+    ///
+    /// Optional on the wire rather than required: a missing field must not
+    /// turn an otherwise fine response into a parse error, since we only act
+    /// on one specific value. Absent is treated as "not truncated" — see
+    /// [`finish_reason_of`].
+    #[serde(default)]
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,6 +181,45 @@ impl DeepSeekClient {
     }
 }
 
+/// The stop reason reported for the first choice, or `""` if the field was
+/// absent. Only the first choice matters — we never request more than one.
+fn finish_reason_of(resp: &DeepSeekResponse) -> &str {
+    resp.choices
+        .first()
+        .and_then(|c| c.finish_reason.as_deref())
+        .unwrap_or_default()
+}
+
+/// Translate a parsed DeepSeek response into the provider-agnostic
+/// [`LLMResponse`], **rejecting a truncated completion**.
+///
+/// The rejection is the point of this function, and it lives here — at the one
+/// place every provider call funnels through — rather than at each handler, so
+/// that a new call site cannot forget it. Truncation is otherwise silent:
+/// reasoning tokens are billed against `max_tokens` without ever appearing in
+/// the output, so an answer cut short arrives looking like an ordinary
+/// response that merely happens to be empty or to stop mid-sentence. Handing
+/// that to a JSON parser reports a formatting problem, which sends whoever
+/// reads the error looking in the wrong place entirely.
+fn to_llm_response(resp: DeepSeekResponse) -> Result<LLMResponse, LLMError> {
+    let finish_reason = finish_reason_of(&resp).to_string();
+    if finish_reason == FINISH_REASON_LENGTH {
+        return Err(LLMError::Truncated { finish_reason });
+    }
+
+    let content = resp
+        .choices
+        .first()
+        .map(|c| c.message.content.clone())
+        .unwrap_or_default();
+
+    Ok(LLMResponse {
+        content,
+        total_tokens: resp.usage.total_tokens,
+        finish_reason,
+    })
+}
+
 #[async_trait]
 impl LLMProvider for DeepSeekClient {
     async fn chat_completion(
@@ -192,16 +244,7 @@ impl LLMProvider for DeepSeekClient {
                 DeepSeekError::Parse(m) => LLMError::Parse(m),
             })?;
 
-        let content = resp
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .unwrap_or_default();
-
-        Ok(LLMResponse {
-            content,
-            total_tokens: resp.usage.total_tokens,
-        })
+        to_llm_response(resp)
     }
 }
 
@@ -234,43 +277,101 @@ mod tests {
         assert_eq!(ds_messages[2].content, "hi there");
     }
 
+    /// Parse a wire-shaped body and run it through the real conversion, so
+    /// these tests exercise `to_llm_response` itself rather than a copy of its
+    /// logic that could drift away from it.
+    fn convert(json: &str) -> Result<LLMResponse, LLMError> {
+        to_llm_response(serde_json::from_str::<DeepSeekResponse>(json).unwrap())
+    }
+
     #[test]
     fn llm_response_extracts_first_choice_and_total_tokens() {
-        let json = r#"{
+        let resp = convert(
+            r#"{
             "choices": [
-                {"message": {"role": "assistant", "content": "the reply"}},
-                {"message": {"role": "assistant", "content": "second choice ignored"}}
+                {"message": {"role": "assistant", "content": "the reply"}, "finish_reason": "stop"},
+                {"message": {"role": "assistant", "content": "second choice ignored"}, "finish_reason": "stop"}
             ],
             "usage": {"total_tokens": 42, "prompt_tokens": 10, "completion_tokens": 32}
-        }"#;
-        let resp: DeepSeekResponse = serde_json::from_str(json).unwrap();
+        }"#,
+        )
+        .expect("a normal completion should convert");
 
-        let content = resp
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .unwrap_or_default();
-
-        assert_eq!(content, "the reply");
-        assert_eq!(resp.usage.total_tokens, 42);
+        assert_eq!(resp.content, "the reply");
+        assert_eq!(resp.total_tokens, 42);
+        assert_eq!(resp.finish_reason, "stop");
     }
 
     #[test]
     fn llm_response_handles_empty_choices_gracefully() {
-        let json = r#"{
-            "choices": [],
-            "usage": {"total_tokens": 5}
-        }"#;
-        let resp: DeepSeekResponse = serde_json::from_str(json).unwrap();
+        let resp = convert(r#"{"choices": [], "usage": {"total_tokens": 5}}"#)
+            .expect("no choices is not a truncation");
 
-        let content = resp
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .unwrap_or_default();
+        assert_eq!(resp.content, "");
+        assert_eq!(resp.total_tokens, 5);
+        assert_eq!(resp.finish_reason, "");
+    }
 
-        assert_eq!(content, "");
-        assert_eq!(resp.usage.total_tokens, 5);
+    #[test]
+    fn missing_finish_reason_is_not_treated_as_truncation() {
+        // The field is optional on the wire; its absence must not fail a
+        // response that is otherwise perfectly usable.
+        let resp = convert(
+            r#"{
+            "choices": [{"message": {"role": "assistant", "content": "fine"}}],
+            "usage": {"total_tokens": 7}
+        }"#,
+        )
+        .expect("a response without finish_reason should still convert");
+
+        assert_eq!(resp.content, "fine");
+        assert_eq!(resp.finish_reason, "");
+    }
+
+    // -- truncation ----------------------------------------------------------
+    //
+    // The bug these guard against: reasoning tokens are billed against
+    // max_tokens without appearing in the output, so a call that runs out of
+    // budget comes back looking ordinary — empty or cut off mid-sentence —
+    // and only finish_reason says otherwise.
+
+    #[test]
+    fn finish_reason_length_is_rejected_as_truncated() {
+        let err = convert(
+            r#"{
+            "choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "length"}],
+            "usage": {"total_tokens": 4096}
+        }"#,
+        )
+        .expect_err("a truncated completion must not convert to a success");
+
+        assert!(matches!(err, LLMError::Truncated { ref finish_reason } if finish_reason == "length"));
+    }
+
+    #[test]
+    fn truncation_is_rejected_even_when_partial_content_came_back() {
+        // The dangerous case: content is non-empty, so nothing downstream
+        // looks wrong until a parser trips over the half-written JSON and
+        // blames the model's formatting.
+        let err = convert(
+            r#"{
+            "choices": [{"message": {"role": "assistant", "content": "[{\"question\": \"Wh"}, "finish_reason": "length"}],
+            "usage": {"total_tokens": 4096}
+        }"#,
+        )
+        .expect_err("partial content plus finish_reason=length is still truncation");
+
+        assert!(matches!(err, LLMError::Truncated { .. }));
+    }
+
+    #[test]
+    fn truncation_error_message_names_the_cause() {
+        // Whoever reads this in a log should not have to guess why an
+        // otherwise-successful call produced nothing.
+        let err = LLMError::Truncated { finish_reason: "length".to_string() };
+        let rendered = err.to_string();
+        assert!(rendered.contains("truncated"), "unexpected message: {rendered}");
+        assert!(rendered.contains("length"), "unexpected message: {rendered}");
     }
 
     #[test]
@@ -298,5 +399,48 @@ mod tests {
             DeepSeekError::Parse(m) => LLMError::Parse(m),
         };
         assert!(matches!(llm_parse, LLMError::Parse(s) if s == "bad json"));
+    }
+
+    // -- live check ----------------------------------------------------------
+    //
+    // #[ignore] by default so the normal `cargo test` run stays offline, same
+    // convention as ks_client's live tests. Run it deliberately:
+    //
+    //     cargo test -p backend -- --ignored --nocapture live_finish_reason
+    //
+    // A fixture can only prove we handle the value we invented for it. This
+    // proves the field is actually present on a real DeepSeek response and
+    // reaches LLMResponse — the part no offline test can establish.
+
+    #[tokio::test]
+    #[ignore = "requires a real DEEPSEEK_API_KEY and network access"]
+    async fn live_finish_reason_is_read_from_a_real_response() {
+        dotenvy::dotenv().ok();
+        dotenvy::from_filename("../.env").ok();
+
+        let client = DeepSeekClient::from_env()
+            .expect("DEEPSEEK_API_KEY must be set in .env to run this test");
+
+        let messages = vec![LLMMessage::user("Reply with the single word: ok")];
+        let resp = LLMProvider::chat_completion(&client, &messages, None)
+            .await
+            .expect("a short prompt should complete without truncation");
+
+        eprintln!(
+            "[live] finish_reason={:?} total_tokens={} content={:?}",
+            resp.finish_reason, resp.total_tokens, resp.content
+        );
+
+        // The value must come from the wire, not from our Default. If this is
+        // empty, the field is not being parsed and every truncation would slip
+        // through undetected.
+        assert!(
+            !resp.finish_reason.is_empty(),
+            "finish_reason came back empty — the field is not being read off the real response"
+        );
+        assert_eq!(
+            resp.finish_reason, "stop",
+            "a short prompt should stop normally"
+        );
     }
 }

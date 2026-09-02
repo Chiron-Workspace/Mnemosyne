@@ -11,7 +11,7 @@ use uuid::Uuid;
 use chrono::{DateTime, Utc};
 
 use crate::llm_provider::{LLMProvider, LLMMessage};
-use super::error_response;
+use super::{describe_llm_failure, error_response};
 
 /// Hard cap on source text length to keep token cost predictable and bounded.
 /// Roughly 1.5-2K tokens of input at average English density — combined with
@@ -299,8 +299,7 @@ pub async fn generate_cards(
             // DeepSeek call never succeeded (network, auth, rate limit). Log
             // the attempted input + a placeholder output that makes the
             // failure reason clear, with 0 tokens since we got nothing back.
-            let placeholder =
-                format!("[no response received from DeepSeek — call failed: {api_err}]");
+            let (placeholder, message) = describe_llm_failure(&api_err);
             let _ = log_ai_interaction(
                 pool.get_ref(),
                 owner.user_id,
@@ -309,10 +308,7 @@ pub async fn generate_cards(
                 0,
             )
             .await;
-            error_response(
-                actix_web::http::StatusCode::BAD_GATEWAY,
-                format!("DeepSeek API call failed: {api_err}"),
-            )
+            error_response(actix_web::http::StatusCode::BAD_GATEWAY, message)
         }
     }
 }

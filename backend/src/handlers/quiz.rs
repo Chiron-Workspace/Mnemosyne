@@ -40,7 +40,7 @@ use uuid::Uuid;
 
 use crate::ks_client::{KsClient, KsNode};
 use crate::llm_provider::{LLMMessage, LLMProvider};
-use super::error_response;
+use super::{describe_llm_failure, error_response};
 
 /// Upper bound on questions per request, to keep token cost predictable.
 const MAX_QUESTION_COUNT: u32 = 20;
@@ -461,15 +461,11 @@ pub async fn generate_quiz(
     let resp = match llm.chat_completion(&messages, None).await {
         Ok(r) => r,
         Err(api_err) => {
-            let placeholder =
-                format!("[no response received from DeepSeek — call failed: {api_err}]");
+            let (placeholder, message) = describe_llm_failure(&api_err);
             let _ =
                 log_ai_interaction(pool.get_ref(), owner.user_id, &prompt_log, &placeholder, 0)
                     .await;
-            return error_response(
-                actix_web::http::StatusCode::BAD_GATEWAY,
-                format!("DeepSeek API call failed: {api_err}"),
-            );
+            return error_response(actix_web::http::StatusCode::BAD_GATEWAY, message);
         }
     };
     let raw = resp.content;

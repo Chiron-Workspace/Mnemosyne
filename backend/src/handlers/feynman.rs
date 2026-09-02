@@ -15,7 +15,7 @@ use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
 use crate::llm_provider::{LLMProvider, LLMMessage};
-use super::error_response;
+use super::{describe_llm_failure, error_response};
 
 /// Cap on total card content included in the evaluation prompt.
 const MAX_CARD_CONTEXT_CHARS: usize = 6000;
@@ -373,8 +373,7 @@ pub async fn evaluate(
             })
         }
         Err(api_err) => {
-            let placeholder =
-                format!("[no response received from DeepSeek — call failed: {api_err}]");
+            let (placeholder, message) = describe_llm_failure(&api_err);
             let _ = log_ai_interaction(
                 pool.get_ref(),
                 body.user_id,
@@ -383,10 +382,7 @@ pub async fn evaluate(
                 0,
             )
             .await;
-            error_response(
-                actix_web::http::StatusCode::BAD_GATEWAY,
-                format!("DeepSeek API call failed: {api_err}"),
-            )
+            error_response(actix_web::http::StatusCode::BAD_GATEWAY, message)
         }
     }
 }

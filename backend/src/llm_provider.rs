@@ -17,9 +17,19 @@ impl LLMMessage {
     }
 }
 
+#[derive(Debug)]
 pub struct LLMResponse {
     pub content: String,
     pub total_tokens: u32,
+    /// Why the model stopped generating, verbatim from the provider
+    /// (`"stop"` on a normal completion). A response that ran out of token
+    /// budget never reaches here — providers must reject it as
+    /// [`LLMError::Truncated`] rather than hand back partial content — so this
+    /// is kept for logging and for spotting future stop reasons we do not yet
+    /// handle, not as something callers are expected to branch on — which is
+    /// why nothing reads it today.
+    #[allow(dead_code)]
+    pub finish_reason: String,
 }
 
 #[derive(Debug)]
@@ -27,6 +37,16 @@ pub enum LLMError {
     Network(String),
     Http { status: u16, body: String },
     Parse(String),
+    /// The model hit its token budget mid-answer (`finish_reason == "length"`).
+    ///
+    /// This is its own variant because the failure is invisible in the payload:
+    /// reasoning tokens count against the budget without appearing in the
+    /// output, so a truncated call can come back with `content` empty or cut
+    /// off mid-sentence and otherwise look like a success. Feeding that to a
+    /// parser produces a confusing "bad JSON" error that blames the model's
+    /// formatting for what is really a budget problem. It is transient —
+    /// retrying, or asking for less, can succeed.
+    Truncated { finish_reason: String },
 }
 
 impl std::fmt::Display for LLMError {
@@ -38,6 +58,11 @@ impl std::fmt::Display for LLMError {
                 write!(f, "upstream HTTP {status}: {snippet}")
             }
             LLMError::Parse(m) => write!(f, "parse error: {m}"),
+            LLMError::Truncated { finish_reason } => write!(
+                f,
+                "response truncated by the token budget (finish_reason: {finish_reason}); \
+                 no usable content was returned"
+            ),
         }
     }
 }

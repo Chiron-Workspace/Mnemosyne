@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::ks_client::{KsClient, SaveTranscriptOutcome, TranscriptTurn};
 use crate::llm_provider::{LLMProvider, LLMMessage};
-use super::error_response;
+use super::{describe_llm_failure, error_response};
 
 /// Cap on total card content (Q+A text) included in the system prompt to
 /// keep token cost bounded. ~6000 chars ≈ 1.5K tokens of context.
@@ -390,8 +390,7 @@ pub async fn start(
             })
         }
         Err(api_err) => {
-            let placeholder =
-                format!("[no response received from DeepSeek — call failed: {api_err}]");
+            let (placeholder, message) = describe_llm_failure(&api_err);
             let _ = log_ai_interaction(
                 pool.get_ref(),
                 body.user_id,
@@ -400,10 +399,7 @@ pub async fn start(
                 0,
             )
             .await;
-            error_response(
-                actix_web::http::StatusCode::BAD_GATEWAY,
-                format!("DeepSeek API call failed: {api_err}"),
-            )
+            error_response(actix_web::http::StatusCode::BAD_GATEWAY, message)
         }
     }
 }
@@ -587,8 +583,7 @@ pub async fn reply(
             })
         }
         Err(api_err) => {
-            let placeholder =
-                format!("[no response received from DeepSeek — call failed: {api_err}]");
+            let (placeholder, message) = describe_llm_failure(&api_err);
             let _ = log_ai_interaction(
                 pool.get_ref(),
                 session.user_id,
@@ -597,10 +592,7 @@ pub async fn reply(
                 0,
             )
             .await;
-            error_response(
-                actix_web::http::StatusCode::BAD_GATEWAY,
-                format!("DeepSeek API call failed: {api_err}"),
-            )
+            error_response(actix_web::http::StatusCode::BAD_GATEWAY, message)
         }
     }
 }
