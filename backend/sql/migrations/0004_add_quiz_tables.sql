@@ -32,7 +32,7 @@
 -- the ai_interaction_type case.
 --
 -- This is a plain SQL authoring artifact. Apply it with:
---   psql -h 127.0.0.1 -p 55432 -U postgres -d mnemosyne -f <this file>
+--   psql -h 127.0.0.1 -p 5432 -U postgres -d mnemosyne -f <this file>
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------

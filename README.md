@@ -83,7 +83,7 @@ Full request/response shapes are documented inline in each handler under `backen
 
 ### Prerequisites
 - Rust 1.90+ (`rustup update`)
-- A local PostgreSQL cluster — Chiron runs one via `chiron-ks-postgres.service` on port 55432
+- A local PostgreSQL cluster — Chiron runs one via `chiron-ks-postgres.service` on port 5432
 - A [DeepSeek API](https://platform.deepseek.com/) key
 
 ### Setup
@@ -93,13 +93,13 @@ Full request/response shapes are documented inline in each handler under `backen
    cp .env.example .env
    ```
 2. Fill in `.env`:
-   - `DATABASE_URL` — your local Postgres URI, e.g. `postgresql://postgres@127.0.0.1:55432/mnemosyne`
+   - `DATABASE_URL` — your local Postgres URI, e.g. `postgresql://postgres@127.0.0.1:5432/mnemosyne`
    - `DEEPSEEK_API_KEY` — from DeepSeek's platform
    - `KS_HTTP_TOKEN` — bearer token for the Knowledge Store HTTP API. Optional: leave it empty and transcript sync is skipped with a startup warning; study sessions are unaffected.
 3. Create the database and apply the schema (this one file includes all tables from migrations 0001–0003; a fresh setup does not need the individual migrations):
    ```bash
-   psql -h 127.0.0.1 -p 55432 -U postgres -c 'CREATE DATABASE mnemosyne'
-   psql -h 127.0.0.1 -p 55432 -U postgres -d mnemosyne -f backend/sql/schema.sql
+   psql -h 127.0.0.1 -p 5432 -U postgres -c 'CREATE DATABASE mnemosyne'
+   psql -h 127.0.0.1 -p 5432 -U postgres -d mnemosyne -f backend/sql/schema.sql
    ```
 4. Build and run:
    ```bash

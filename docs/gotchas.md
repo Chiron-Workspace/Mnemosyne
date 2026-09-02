@@ -13,7 +13,7 @@ painful to diagnose.
 >
 > Mnemosyne no longer uses Supabase. It now connects directly to the local
 > Postgres cluster shared with the Knowledge Store
-> (`chiron-ks-postgres.service`, port 55432, its own `mnemosyne` database).
+> (`chiron-ks-postgres.service`, port 5432, its own `mnemosyne` database).
 > There is no connection pooler in the path, so sqlx's default
 > prepared-statement caching is safe. Every `.persistent(false)` call and the
 > `statement_cache_capacity(0)` option have been removed from the codebase.
