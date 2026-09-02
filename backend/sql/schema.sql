@@ -44,13 +44,32 @@ CREATE INDEX idx_study_sets_topic ON study_sets (topic);
 -- Table: cards
 -- Individual flashcards belonging to a study set. Each card contains a
 -- question (prompt) and an answer (the target knowledge to be recalled).
+--
+-- `source` records provenance, added by migration 0005: 'manual' for a card
+-- typed in through POST /cards, 'topic' for one generated from free text by
+-- POST /study_sets/{set_id}/generate_cards, and 'knowledge_store' for one
+-- generated from a concept node by POST /cards/from_node. As with
+-- quiz_questions, source_node_id deliberately has NO foreign key — the
+-- Knowledge Store is a separate database on the same cluster and Postgres
+-- cannot enforce referential integrity across databases.
 -- ---------------------------------------------------------------------------
 CREATE TABLE cards (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    set_id      UUID NOT NULL REFERENCES study_sets(id) ON DELETE CASCADE,
-    question    TEXT NOT NULL,
-    answer      TEXT NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    set_id          UUID NOT NULL REFERENCES study_sets(id) ON DELETE CASCADE,
+    question        TEXT NOT NULL,
+    answer          TEXT NOT NULL,
+    source          TEXT NOT NULL DEFAULT 'manual'
+                        CHECK (source IN ('manual', 'topic', 'knowledge_store')),
+    source_node_id  UUID,  -- ks.nodes(id) when source='knowledge_store'; no FK, different database
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT cards_node_id_iff_knowledge_store
+        CHECK ((source = 'knowledge_store') = (source_node_id IS NOT NULL)),
+
+    -- One card per concept per study set — the idempotency key for
+    -- POST /cards/from_node. NULLs are distinct in Postgres, so manual and
+    -- topic-generated cards (source_node_id IS NULL) are unconstrained.
+    CONSTRAINT cards_set_node_unique UNIQUE (set_id, source_node_id)
 );
 
 CREATE INDEX idx_cards_set_id ON cards (set_id);
@@ -98,7 +117,8 @@ CREATE TYPE ai_interaction_type AS ENUM (
     'question_generation',
     'socratic_dialogue',
     'feynman_evaluation',
-    'quiz_generation'
+    'quiz_generation',
+    'card_from_node_generation'
 );
 
 CREATE TABLE ai_interactions (

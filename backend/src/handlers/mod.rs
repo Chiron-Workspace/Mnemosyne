@@ -5,6 +5,7 @@
 //! endpoints in this module: `{"error": "<message>"}`.
 
 pub mod cards;
+pub mod cards_from_node;
 pub mod due;
 pub mod feynman;
 pub mod generate;

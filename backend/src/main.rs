@@ -128,6 +128,7 @@ async fn main() -> std::io::Result<()> {
             .service(handlers::study_sets::list_study_sets)
             .service(handlers::cards::create_card)
             .service(handlers::cards::list_cards)
+            .service(handlers::cards_from_node::from_node)
             .service(handlers::reviews::review)
             .service(handlers::generate::generate_cards)
             .service(handlers::due::due)

@@ -6,7 +6,9 @@
 //! client.
 //!
 //! Scope is deliberately narrow: `GET /health`, `POST /transcripts`, and
-//! `GET /nodes`. `POST /ingest` is **not** implemented here. Per the agreed
+//! `GET /nodes` (both listing and single-node lookup, the latter filtered
+//! client-side since KS has no by-id route). `POST /ingest` is **not**
+//! implemented here. Per the agreed
 //! design, Mnemosyne only ever ships raw transcripts; concept extraction is
 //! KS's own job, run in-process on the Python side by a systemd timer.
 //! `/ingest` exists to serve LexiFlash later and has no consumer in Mnemosyne.
@@ -38,9 +40,17 @@
 //! stored record; the first write wins.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Default KS port. Overridable via `KS_HTTP_PORT`.
 const DEFAULT_PORT: &str = "8080";
+
+/// Page size requested when looking up a single node by id.
+///
+/// Matches KS's `MAX_NODE_LIMIT`, the largest page it will serve — asking for
+/// more is a 400, not a bigger page. See [`KsClient::get_node`] for why the
+/// limit is stated rather than left at KS's default of 50.
+const NODE_LOOKUP_LIMIT: u32 = 500;
 
 /// `/transcripts` writes straight to Postgres with no LLM in the path, so a
 /// short timeout is correct — there is nothing slow to wait for.
@@ -181,6 +191,32 @@ fn base_url_for_port(port: &str) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// Build the query string for `GET /nodes`, including the leading `?` when
+/// there is anything to send and nothing at all when there is not.
+fn nodes_query(subject: Option<&str>, limit: Option<u32>) -> String {
+    let mut params: Vec<String> = Vec::new();
+    if let Some(subject) = subject {
+        params.push(format!("subject={}", percent_encode_query_value(subject)));
+    }
+    if let Some(limit) = limit {
+        params.push(format!("limit={limit}"));
+    }
+    if params.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", params.join("&"))
+    }
+}
+
+/// Pick the node whose id equals `node_id`, comparing parsed UUIDs so that
+/// textual differences (case, surrounding whitespace) cannot cause a false
+/// miss. A node with an unparseable id is skipped, never loosely matched.
+fn find_node_by_id(nodes: Vec<KsNode>, node_id: Uuid) -> Option<KsNode> {
+    nodes
+        .into_iter()
+        .find(|n| Uuid::parse_str(n.id.trim()).is_ok_and(|id| id == node_id))
+}
+
 /// Map an HTTP status onto the error taxonomy. `Ok(())` means the body is
 /// worth parsing.
 ///
@@ -270,13 +306,11 @@ struct NodesEnvelope {
 
 /// Parse a `GET /nodes` body.
 ///
-/// **The exact response shape is not yet fixed.** At the time this was
-/// written, KS exposed only `/health`, `/transcripts` and `/ingest` — the
-/// `/nodes` route did not exist, so there was no contract to code against.
-/// Rather than guess once and be wrong, this accepts the two shapes KS
-/// plausibly returns: an envelope `{"nodes": [...]}` (matching how
-/// `/transcripts` wraps its result) or a bare array `[...]`. When the real
-/// route lands, confirm which one it is and this can be narrowed.
+/// The route is live and returns the envelope form, `{"nodes": [...]}` —
+/// confirmed against a running KS. The bare-array branch is left in place from
+/// when the contract was still unknown: it costs one fallback attempt on a
+/// body that would otherwise be an error anyway, and removing it would buy
+/// nothing but a narrower client.
 fn parse_nodes_response(body: &str) -> Result<Vec<KsNode>, KsError> {
     if let Ok(envelope) = serde_json::from_str::<NodesEnvelope>(body) {
         return Ok(envelope.nodes);
@@ -374,18 +408,37 @@ impl KsClient {
     /// node's `title` and `summary` so the learner is tested on what they have
     /// actually covered, rather than on free text they typed just now.
     ///
-    /// **Not yet exercised against a live KS.** The `/nodes` route did not
-    /// exist when this was written; see [`parse_nodes_response`] for the shape
-    /// assumption this makes.
+    /// Returns however many nodes KS's own default limit allows. Callers that
+    /// need a specific node should use [`KsClient::get_node`] instead of
+    /// scanning this themselves.
     pub async fn get_nodes(&self, subject: Option<&str>) -> Result<Vec<KsNode>, KsError> {
-        let url = match subject {
-            Some(subject) => format!(
-                "{}/nodes?subject={}",
-                self.base_url,
-                percent_encode_query_value(subject)
-            ),
-            None => format!("{}/nodes", self.base_url),
-        };
+        self.fetch_nodes(subject, None).await
+    }
+
+    /// Fetch one node by id.
+    ///
+    /// KS exposes no `GET /nodes/{id}` route, so this lists nodes and picks the
+    /// match here. To keep that honest it asks for [`NODE_LOOKUP_LIMIT`]
+    /// explicitly: KS's default page is 50, and silently searching only the
+    /// first 50 would report a perfectly real node as missing. **Past
+    /// [`NODE_LOOKUP_LIMIT`] nodes this approach stops being correct** — a
+    /// lookup would 404 on something that exists. That is the point to ask KS
+    /// for a by-id route rather than to raise the number again.
+    ///
+    /// Ids are compared as parsed UUIDs, not as strings, so formatting
+    /// differences on either side cannot cause a false miss. A node whose id
+    /// does not parse is skipped rather than matched loosely.
+    pub async fn get_node(&self, node_id: Uuid) -> Result<Option<KsNode>, KsError> {
+        let nodes = self.fetch_nodes(None, Some(NODE_LOOKUP_LIMIT)).await?;
+        Ok(find_node_by_id(nodes, node_id))
+    }
+
+    async fn fetch_nodes(
+        &self,
+        subject: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<KsNode>, KsError> {
+        let url = format!("{}/nodes{}", self.base_url, nodes_query(subject, limit));
 
         let resp = self
             .http
@@ -602,6 +655,71 @@ mod tests {
         assert!(parse_nodes_response(r#"{"nodes": []}"#).unwrap().is_empty());
     }
 
+    // -- single-node lookup --------------------------------------------------
+
+    fn node(id: &str, title: &str) -> KsNode {
+        KsNode {
+            id: id.to_string(),
+            title: title.to_string(),
+            subject: "Vật lý".to_string(),
+            summary: "…".to_string(),
+        }
+    }
+
+    const NODE_A: &str = "5248a55b-ca35-4a33-8479-09d0ec0a6784";
+    const NODE_B: &str = "8bea853e-1cea-4114-a3b5-e77b487b88b9";
+
+    #[test]
+    fn lookup_finds_the_requested_node() {
+        let nodes = vec![node(NODE_A, "Định luật II Newton"), node(NODE_B, "Gia tốc")];
+        let found = find_node_by_id(nodes, Uuid::parse_str(NODE_B).unwrap()).unwrap();
+        assert_eq!(found.title, "Gia tốc");
+    }
+
+    #[test]
+    fn lookup_of_an_absent_node_is_none_not_an_error() {
+        // A caller asking for a node that was never studied is a 404, not a
+        // failure of the client.
+        let nodes = vec![node(NODE_A, "Định luật II Newton")];
+        assert!(find_node_by_id(nodes, Uuid::parse_str(NODE_B).unwrap()).is_none());
+    }
+
+    #[test]
+    fn lookup_compares_uuids_not_raw_strings() {
+        // Same id, different text. A string comparison would miss this.
+        let nodes = vec![node(&NODE_A.to_uppercase(), "Định luật II Newton")];
+        assert!(find_node_by_id(nodes, Uuid::parse_str(NODE_A).unwrap()).is_some());
+    }
+
+    #[test]
+    fn lookup_skips_a_node_whose_id_does_not_parse() {
+        let nodes = vec![node("not-a-uuid", "rác"), node(NODE_A, "Định luật II Newton")];
+        let found = find_node_by_id(nodes, Uuid::parse_str(NODE_A).unwrap()).unwrap();
+        assert_eq!(found.title, "Định luật II Newton");
+    }
+
+    // -- query building ------------------------------------------------------
+
+    #[test]
+    fn nodes_query_is_empty_when_nothing_is_constrained() {
+        assert_eq!(nodes_query(None, None), "");
+    }
+
+    #[test]
+    fn nodes_query_states_the_limit_for_a_by_id_lookup() {
+        // The limit must be explicit: KS defaults to 50, and searching only
+        // the first 50 would report a real node as missing.
+        assert_eq!(nodes_query(None, Some(NODE_LOOKUP_LIMIT)), "?limit=500");
+    }
+
+    #[test]
+    fn nodes_query_encodes_subject_and_combines_params() {
+        assert_eq!(
+            nodes_query(Some("Vật lý"), Some(10)),
+            "?subject=V%E1%BA%ADt%20l%C3%BD&limit=10"
+        );
+    }
+
     #[test]
     fn malformed_nodes_body_is_a_parse_error() {
         assert!(matches!(
@@ -664,11 +782,12 @@ mod tests {
         }
     }
 
-    // Separate from the transcript live check because it depends on a KS route
-    // that does not exist yet. Un-ignore only once GET /nodes is confirmed
-    // live, then verify with log correlation the same way /transcripts was.
+    // GET /nodes is live and confirmed working (it returns the documented
+    // {"nodes": [...]} envelope). Kept #[ignore] for the same reason as the
+    // transcript check above — it needs a running KS and a real token — not
+    // because the route is in doubt.
     #[tokio::test]
-    #[ignore = "GET /nodes does not exist in KS yet — un-ignore once the route is confirmed live"]
+    #[ignore = "requires a running Knowledge Store and a real KS_HTTP_TOKEN"]
     async fn live_get_nodes() {
         dotenvy::dotenv().ok();
         dotenvy::from_filename("../.env").ok();

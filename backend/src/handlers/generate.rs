@@ -242,9 +242,15 @@ pub async fn generate_cards(
             //    successful count surfaced in the error message.
             let mut created: Vec<CreatedCard> = Vec::with_capacity(validated.len());
             for p in &validated {
+                // source='topic': these were written by the model from free
+                // text the user supplied, which is a different provenance from
+                // a hand-typed card (POST /cards, 'manual') and from one built
+                // out of a Knowledge Store concept ('knowledge_store'). Stamped
+                // explicitly rather than left to the column default, which
+                // would file every generated card as hand-written.
                 match sqlx::query_as::<_, CreatedCard>(
-                    r#"INSERT INTO cards (set_id, question, answer)
-                       VALUES ($1, $2, $3)
+                    r#"INSERT INTO cards (set_id, question, answer, source)
+                       VALUES ($1, $2, $3, 'topic')
                        RETURNING id, set_id, question, answer, created_at"#,
                 )
                 .bind(set_id)
