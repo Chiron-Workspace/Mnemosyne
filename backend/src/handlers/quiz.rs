@@ -461,11 +461,16 @@ pub async fn generate_quiz(
     let resp = match llm.chat_completion(&messages, None).await {
         Ok(r) => r,
         Err(api_err) => {
-            let (placeholder, message) = describe_llm_failure(&api_err);
-            let _ =
-                log_ai_interaction(pool.get_ref(), owner.user_id, &prompt_log, &placeholder, 0)
-                    .await;
-            return error_response(actix_web::http::StatusCode::BAD_GATEWAY, message);
+            let failure = describe_llm_failure(&api_err);
+            let _ = log_ai_interaction(
+                pool.get_ref(),
+                owner.user_id,
+                &prompt_log,
+                &failure.placeholder,
+                failure.tokens_used,
+            )
+            .await;
+            return error_response(actix_web::http::StatusCode::BAD_GATEWAY, failure.message);
         }
     };
     let raw = resp.content;

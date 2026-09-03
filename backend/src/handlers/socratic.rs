@@ -390,16 +390,16 @@ pub async fn start(
             })
         }
         Err(api_err) => {
-            let (placeholder, message) = describe_llm_failure(&api_err);
+            let failure = describe_llm_failure(&api_err);
             let _ = log_ai_interaction(
                 pool.get_ref(),
                 body.user_id,
                 &prompt_log,
-                &placeholder,
-                0,
+                &failure.placeholder,
+                failure.tokens_used,
             )
             .await;
-            error_response(actix_web::http::StatusCode::BAD_GATEWAY, message)
+            error_response(actix_web::http::StatusCode::BAD_GATEWAY, failure.message)
         }
     }
 }
@@ -583,16 +583,16 @@ pub async fn reply(
             })
         }
         Err(api_err) => {
-            let (placeholder, message) = describe_llm_failure(&api_err);
+            let failure = describe_llm_failure(&api_err);
             let _ = log_ai_interaction(
                 pool.get_ref(),
                 session.user_id,
                 &prompt_log,
-                &placeholder,
-                0,
+                &failure.placeholder,
+                failure.tokens_used,
             )
             .await;
-            error_response(actix_web::http::StatusCode::BAD_GATEWAY, message)
+            error_response(actix_web::http::StatusCode::BAD_GATEWAY, failure.message)
         }
     }
 }

@@ -283,11 +283,16 @@ pub async fn from_node(
         Err(api_err) => {
             // Covers truncation too: the provider rejects finish_reason=length
             // rather than handing back a half-written answer.
-            let (placeholder, message) = describe_llm_failure(&api_err);
-            let _ =
-                log_ai_interaction(pool.get_ref(), owner.user_id, &prompt_log, &placeholder, 0)
-                    .await;
-            return upstream_error(message, llm_failure_reason(&api_err));
+            let failure = describe_llm_failure(&api_err);
+            let _ = log_ai_interaction(
+                pool.get_ref(),
+                owner.user_id,
+                &prompt_log,
+                &failure.placeholder,
+                failure.tokens_used,
+            )
+            .await;
+            return upstream_error(failure.message, llm_failure_reason(&api_err));
         }
     };
     let raw = resp.content;
@@ -631,6 +636,7 @@ mod tests {
             outcome: || {
                 Err(LLMError::Truncated {
                     finish_reason: "length".into(),
+                    total_tokens: 4096,
                 })
             },
         };
@@ -639,8 +645,16 @@ mod tests {
             .await
             .expect_err("this fake provider only fails");
 
-        let (_, message) = describe_llm_failure(&err);
-        let (status, body) = parts_of(upstream_error(message, llm_failure_reason(&err))).await;
+        let failure = describe_llm_failure(&err);
+
+        // What gets written to ai_interactions for this failure. The tokens
+        // were spent — mostly on reasoning that never reached the output — so
+        // the row must say so; logging 0 would make the most expensive kind of
+        // failure the one that looks free.
+        assert_eq!(failure.tokens_used, 4096);
+
+        let (status, body) =
+            parts_of(upstream_error(failure.message, llm_failure_reason(&err))).await;
 
         assert_eq!(status, 502);
         assert_eq!(body["reason"], "truncated");

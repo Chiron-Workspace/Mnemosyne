@@ -243,7 +243,10 @@ fn to_llm_response(resp: DeepSeekResponse) -> Result<LLMResponse, LLMError> {
             reasoning.map_or_else(|| "unreported".to_string(), |r| r.to_string()),
             resp.choices.first().map_or(0, |c| c.message.content.chars().count()),
         );
-        return Err(LLMError::Truncated { finish_reason });
+        return Err(LLMError::Truncated {
+            finish_reason,
+            total_tokens: resp.usage.total_tokens,
+        });
     }
 
     let content = resp
@@ -384,7 +387,13 @@ mod tests {
         )
         .expect_err("a truncated completion must not convert to a success");
 
-        assert!(matches!(err, LLMError::Truncated { ref finish_reason } if finish_reason == "length"));
+        // The usage comes along: a truncated call is billed in full, and the
+        // handler needs the figure to record what the failure cost.
+        assert!(matches!(
+            err,
+            LLMError::Truncated { ref finish_reason, total_tokens: 4096 }
+                if finish_reason == "length"
+        ));
     }
 
     #[test]
@@ -466,7 +475,7 @@ mod tests {
     fn truncation_error_message_names_the_cause() {
         // Whoever reads this in a log should not have to guess why an
         // otherwise-successful call produced nothing.
-        let err = LLMError::Truncated { finish_reason: "length".to_string() };
+        let err = LLMError::Truncated { finish_reason: "length".to_string(), total_tokens: 4096 };
         let rendered = err.to_string();
         assert!(rendered.contains("truncated"), "unexpected message: {rendered}");
         assert!(rendered.contains("length"), "unexpected message: {rendered}");

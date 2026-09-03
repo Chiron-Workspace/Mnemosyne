@@ -24,9 +24,19 @@ pub fn error_response(status: actix_web::http::StatusCode, message: impl Into<St
     HttpResponse::build(status).json(serde_json::json!({ "error": message.into() }))
 }
 
-/// Render an [`LLMError`] into the two strings every AI handler needs when a
-/// provider call fails: what to record as `ai_interactions.output_text`, and
-/// what to tell the caller.
+/// Everything an AI handler needs to record and report a failed provider call.
+pub struct LlmFailure {
+    /// What to write to `ai_interactions.output_text`.
+    pub placeholder: String,
+    /// What to tell the caller.
+    pub message: String,
+    /// What the call actually cost. See [`describe_llm_failure`] for why this
+    /// is zero for every failure except truncation.
+    pub tokens_used: u32,
+}
+
+/// Render an [`LLMError`] into what every AI handler needs when a provider
+/// call fails.
 ///
 /// Shared rather than repeated per handler so that truncation stays
 /// distinguishable everywhere. The generic phrasing ("no response received")
@@ -35,16 +45,41 @@ pub fn error_response(status: actix_web::http::StatusCode, message: impl Into<St
 /// call is worth retrying or asking for less, whereas a 401 never is. Both
 /// still map to 502 for the client, since either way this service could not
 /// produce the answer it promised.
-pub fn describe_llm_failure(err: &LLMError) -> (String, String) {
+///
+/// # What `tokens_used` means, and does not
+///
+/// Only truncation reports a real figure. The provider returns `usage` for a
+/// truncated completion exactly as it does for a finished one, and that number
+/// matters: measurement has shown a truncated call spending its entire budget,
+/// almost all of it on reasoning that never reached the output. Recording zero
+/// there would make the most expensive kind of failure the one that looks free.
+///
+/// For the rest, zero is the honest figure for a different reason in each case,
+/// and in one of them it is not really a figure at all:
+///
+/// - [`LLMError::Network`] — nothing arrived, and a request that never reached
+///   the provider is not billed. Zero is true.
+/// - [`LLMError::Http`] — a rejected request (401, 429) is not billed, and the
+///   provider's error bodies carry no `usage` regardless. Zero is true.
+/// - [`LLMError::Parse`] — **zero here means "unknown", not "free".** The body
+///   did not match the schema, so whatever `usage` it may have held could not
+///   be read; a 2xx with an empty body (which has happened — see
+///   `docs/gotchas.md`) may well have been billed. Distinguishing the two would
+///   need a nullable column, which is a schema change and not this function's
+///   to make. Until then, the accompanying `placeholder` says plainly that the
+///   call failed, so nobody reading the row mistakes it for a free success.
+pub fn describe_llm_failure(err: &LLMError) -> LlmFailure {
     match err {
-        LLMError::Truncated { finish_reason } => (
-            format!("[truncated by the token budget (finish_reason: {finish_reason}) — no usable content returned]"),
-            format!("DeepSeek stopped mid-answer at its token limit ({finish_reason}); nothing was parsed. Retrying, or requesting fewer items, may succeed."),
-        ),
-        other => (
-            format!("[no response received from DeepSeek — call failed: {other}]"),
-            format!("DeepSeek API call failed: {other}"),
-        ),
+        LLMError::Truncated { finish_reason, total_tokens } => LlmFailure {
+            placeholder: format!("[truncated by the token budget (finish_reason: {finish_reason}) — no usable content returned]"),
+            message: format!("DeepSeek stopped mid-answer at its token limit ({finish_reason}); nothing was parsed. Retrying, or requesting fewer items, may succeed."),
+            tokens_used: *total_tokens,
+        },
+        other => LlmFailure {
+            placeholder: format!("[no response received from DeepSeek — call failed: {other}]"),
+            message: format!("DeepSeek API call failed: {other}"),
+            tokens_used: 0,
+        },
     }
 }
 
@@ -58,13 +93,13 @@ fn pg_sqlstate(err: &sqlx::Error) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::describe_llm_failure;
+    use super::{describe_llm_failure, LlmFailure};
     use crate::llm_provider::LLMError;
 
     #[test]
     fn truncation_is_reported_as_truncation_not_as_a_dead_call() {
-        let (placeholder, message) =
-            describe_llm_failure(&LLMError::Truncated { finish_reason: "length".into() });
+        let LlmFailure { placeholder, message, .. } =
+            describe_llm_failure(&LLMError::Truncated { finish_reason: "length".into(), total_tokens: 4096 });
 
         // What lands in ai_interactions.output_text must say the model did
         // answer and was cut off, not that nothing came back — the two call
@@ -76,7 +111,7 @@ mod tests {
 
     #[test]
     fn other_failures_keep_the_original_phrasing() {
-        let (placeholder, message) =
+        let LlmFailure { placeholder, message, .. } =
             describe_llm_failure(&LLMError::Http { status: 401, body: "unauthorized".into() });
 
         assert!(placeholder.contains("no response received"), "placeholder: {placeholder}");
@@ -89,11 +124,37 @@ mod tests {
             LLMError::Network("timeout".into()),
             LLMError::Http { status: 500, body: "boom".into() },
             LLMError::Parse("bad json".into()),
-            LLMError::Truncated { finish_reason: "length".into() },
+            LLMError::Truncated { finish_reason: "length".into(), total_tokens: 4096 },
         ] {
-            let (placeholder, message) = describe_llm_failure(&err);
-            assert!(!placeholder.is_empty(), "empty placeholder for {err:?}");
-            assert!(!message.is_empty(), "empty message for {err:?}");
+            let failure = describe_llm_failure(&err);
+            assert!(!failure.placeholder.is_empty(), "empty placeholder for {err:?}");
+            assert!(!failure.message.is_empty(), "empty message for {err:?}");
+        }
+    }
+
+    #[test]
+    fn a_truncated_call_reports_what_it_spent() {
+        // The whole point: this failure is billed in full, mostly for
+        // reasoning nobody ever sees. Logging zero would hide the most
+        // expensive failure there is behind the cheapest-looking number.
+        let failure = describe_llm_failure(&LLMError::Truncated {
+            finish_reason: "length".into(),
+            total_tokens: 4096,
+        });
+        assert_eq!(failure.tokens_used, 4096);
+    }
+
+    #[test]
+    fn failures_that_report_no_usage_record_zero() {
+        // Zero for a reason that differs per variant — nothing was billed for
+        // Network and Http; for Parse the number simply did not survive the
+        // body. See this function's docs.
+        for err in [
+            LLMError::Network("timeout".into()),
+            LLMError::Http { status: 401, body: "unauthorized".into() },
+            LLMError::Parse("EOF while parsing a value".into()),
+        ] {
+            assert_eq!(describe_llm_failure(&err).tokens_used, 0, "for {err:?}");
         }
     }
 }

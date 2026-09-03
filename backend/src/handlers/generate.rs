@@ -305,16 +305,16 @@ pub async fn generate_cards(
             // DeepSeek call never succeeded (network, auth, rate limit). Log
             // the attempted input + a placeholder output that makes the
             // failure reason clear, with 0 tokens since we got nothing back.
-            let (placeholder, message) = describe_llm_failure(&api_err);
+            let failure = describe_llm_failure(&api_err);
             let _ = log_ai_interaction(
                 pool.get_ref(),
                 owner.user_id,
                 &prompt_log,
-                &placeholder,
-                0,
+                &failure.placeholder,
+                failure.tokens_used,
             )
             .await;
-            error_response(actix_web::http::StatusCode::BAD_GATEWAY, message)
+            error_response(actix_web::http::StatusCode::BAD_GATEWAY, failure.message)
         }
     }
 }

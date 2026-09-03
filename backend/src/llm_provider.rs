@@ -39,6 +39,13 @@ pub enum LLMError {
     Parse(String),
     /// The model hit its token budget mid-answer (`finish_reason == "length"`).
     ///
+    /// Carries `total_tokens` because this is the one failure that provably
+    /// cost something: the provider reports usage for a truncated completion
+    /// exactly as it does for a finished one, and the whole budget was spent —
+    /// mostly on reasoning that never reached the output. A failed call that
+    /// records zero tokens would make the most expensive kind of failure the
+    /// one that looks free.
+    ///
     /// This is its own variant because the failure is invisible in the payload:
     /// reasoning tokens count against the budget without appearing in the
     /// output, so a truncated call can come back with `content` empty or cut
@@ -46,7 +53,7 @@ pub enum LLMError {
     /// parser produces a confusing "bad JSON" error that blames the model's
     /// formatting for what is really a budget problem. It is transient —
     /// retrying, or asking for less, can succeed.
-    Truncated { finish_reason: String },
+    Truncated { finish_reason: String, total_tokens: u32 },
 }
 
 impl std::fmt::Display for LLMError {
@@ -58,10 +65,10 @@ impl std::fmt::Display for LLMError {
                 write!(f, "upstream HTTP {status}: {snippet}")
             }
             LLMError::Parse(m) => write!(f, "parse error: {m}"),
-            LLMError::Truncated { finish_reason } => write!(
+            LLMError::Truncated { finish_reason, total_tokens } => write!(
                 f,
-                "response truncated by the token budget (finish_reason: {finish_reason}); \
-                 no usable content was returned"
+                "response truncated by the token budget (finish_reason: {finish_reason}, \
+                 {total_tokens} tokens spent); no usable content was returned"
             ),
         }
     }
