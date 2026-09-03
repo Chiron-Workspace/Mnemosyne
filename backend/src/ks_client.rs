@@ -5,9 +5,8 @@
 //! two live in different runtimes — so every interaction goes through this
 //! client.
 //!
-//! Scope is deliberately narrow: `GET /health`, `POST /transcripts`, and
-//! `GET /nodes` (both listing and single-node lookup, the latter filtered
-//! client-side since KS has no by-id route). `POST /ingest` is **not**
+//! Scope is deliberately narrow: `GET /health`, `POST /transcripts`,
+//! `GET /nodes` and `GET /nodes/{id}`. `POST /ingest` is **not**
 //! implemented here. Per the agreed
 //! design, Mnemosyne only ever ships raw transcripts; concept extraction is
 //! KS's own job, run in-process on the Python side by a systemd timer.
@@ -45,12 +44,17 @@ use uuid::Uuid;
 /// Default KS port. Overridable via `KS_HTTP_PORT`.
 const DEFAULT_PORT: &str = "8080";
 
-/// Page size requested when looking up a single node by id.
+/// Page size requested when looking up a single node by id **on the fallback
+/// path only** — see [`KsClient::get_node`].
 ///
 /// Matches KS's `MAX_NODE_LIMIT`, the largest page it will serve — asking for
-/// more is a 400, not a bigger page. See [`KsClient::get_node`] for why the
-/// limit is stated rather than left at KS's default of 50.
+/// more is a 400, not a bigger page. The limit is stated rather than left at
+/// KS's default of 50 because silently searching only the first 50 would
+/// report a perfectly real node as missing.
 const NODE_LOOKUP_LIMIT: u32 = 500;
+
+/// The `error` code KS returns in the body of its own "no such node" 404.
+const ERROR_NODE_NOT_FOUND: &str = "node_not_found";
 
 /// `/transcripts` writes straight to Postgres with no LLM in the path, so a
 /// short timeout is correct — there is nothing slow to wait for.
@@ -323,6 +327,54 @@ fn parse_nodes_response(body: &str) -> Result<Vec<KsNode>, KsError> {
     })
 }
 
+/// Parse a `GET /nodes/{id}` body: a bare node object.
+///
+/// Strict where [`parse_nodes_response`] is lenient. That route's shape was
+/// unknown when it was written; this one arrives with a contract that states
+/// the object is *not* wrapped in `{"node": ...}`, so a wrapped body would be
+/// KS breaking its own contract — worth surfacing as a parse error rather than
+/// quietly accommodating.
+fn parse_node_response(body: &str) -> Result<KsNode, KsError> {
+    serde_json::from_str::<KsNode>(body).map_err(|e| {
+        KsError::Parse(format!(
+            "{e}; expected a bare node object from GET /nodes/{{id}}; body snippet: {}",
+            body.chars().take(500).collect::<String>()
+        ))
+    })
+}
+
+/// The `{"error": "...", "detail": "..."}` shape KS uses for its own errors.
+#[derive(Debug, Deserialize)]
+struct KsErrorBody {
+    error: String,
+}
+
+/// What a `GET /nodes/{id}` call established.
+#[derive(Debug)]
+enum ByIdOutcome {
+    Found(KsNode),
+    /// KS answered its documented 404: it has no such node.
+    NotFound,
+    /// The 404 came from the web framework, not from KS — the route is not
+    /// deployed on the KS this client is talking to.
+    RouteAbsent,
+}
+
+/// Tell KS's "no such node" apart from Flask's "no such route". Both are 404s
+/// and they mean opposite things: the first is a final answer, the second says
+/// to ask a different way.
+///
+/// The tell is the body. KS answers with JSON naming the error; Werkzeug
+/// answers with an HTML page. Either misreading is harmless — a JSON 404 we
+/// failed to recognise merely costs one extra list call that reaches the same
+/// `None` — so the heuristic cannot produce a wrong answer, only a slower one.
+fn classify_not_found(body: &str) -> ByIdOutcome {
+    match serde_json::from_str::<KsErrorBody>(body) {
+        Ok(parsed) if parsed.error == ERROR_NODE_NOT_FOUND => ByIdOutcome::NotFound,
+        _ => ByIdOutcome::RouteAbsent,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
@@ -417,20 +469,72 @@ impl KsClient {
 
     /// Fetch one node by id.
     ///
-    /// KS exposes no `GET /nodes/{id}` route, so this lists nodes and picks the
-    /// match here. To keep that honest it asks for [`NODE_LOOKUP_LIMIT`]
-    /// explicitly: KS's default page is 50, and silently searching only the
-    /// first 50 would report a perfectly real node as missing. **Past
-    /// [`NODE_LOOKUP_LIMIT`] nodes this approach stops being correct** — a
-    /// lookup would 404 on something that exists. That is the point to ask KS
-    /// for a by-id route rather than to raise the number again.
+    /// Prefers `GET /nodes/{id}`, and falls back to listing nodes and picking
+    /// the match here when that route is not deployed on the KS being talked
+    /// to. The fallback is what this method used to do outright; it stays only
+    /// until the by-id route is confirmed live, because the two paths are not
+    /// equivalent:
     ///
-    /// Ids are compared as parsed UUIDs, not as strings, so formatting
-    /// differences on either side cannot cause a false miss. A node whose id
-    /// does not parse is skipped rather than matched loosely.
+    /// - The by-id route **resolves merges**: ask for a node that was merged
+    ///   into another and KS answers 200 with the surviving node, whose `id`
+    ///   is therefore *not* the id that was asked for. This method returns
+    ///   that node unchanged — callers must not assume `node.id` echoes their
+    ///   argument.
+    /// - The fallback cannot do that. It matches an id exactly, so a merged-away
+    ///   id comes back as `None` there and as the surviving node here. That
+    ///   divergence is the reason not to leave the fallback in place any longer
+    ///   than it takes KS to ship the route.
+    /// - The fallback is also bounded by [`NODE_LOOKUP_LIMIT`]: past that many
+    ///   nodes it would report a real node as missing.
+    ///
+    /// On the fallback path ids are compared as parsed UUIDs, not as strings,
+    /// so formatting differences on either side cannot cause a false miss. A
+    /// node whose id does not parse is skipped rather than matched loosely.
     pub async fn get_node(&self, node_id: Uuid) -> Result<Option<KsNode>, KsError> {
-        let nodes = self.fetch_nodes(None, Some(NODE_LOOKUP_LIMIT)).await?;
-        Ok(find_node_by_id(nodes, node_id))
+        match self.fetch_node_by_id(node_id).await? {
+            ByIdOutcome::Found(node) => Ok(Some(node)),
+            ByIdOutcome::NotFound => Ok(None),
+            ByIdOutcome::RouteAbsent => {
+                let nodes = self.fetch_nodes(None, Some(NODE_LOOKUP_LIMIT)).await?;
+                Ok(find_node_by_id(nodes, node_id))
+            }
+        }
+    }
+
+    /// One `GET /nodes/{id}` call. A 404 is not an error here — it is an
+    /// answer, and [`classify_not_found`] decides which of the two answers it
+    /// is. Every other non-2xx status goes through [`check_status`] like the
+    /// rest of the client: 403 for a bad token, 503 when KS's database is
+    /// down, 400 for an id KS rejects (which this client should never send,
+    /// since it formats a parsed [`Uuid`]).
+    async fn fetch_node_by_id(&self, node_id: Uuid) -> Result<ByIdOutcome, KsError> {
+        let resp = self
+            .http
+            .get(format!("{}/nodes/{node_id}", self.base_url))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| KsError::Unreachable(e.to_string()))?;
+
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+
+        if status == 404 {
+            return Ok(classify_not_found(&body));
+        }
+        if status == 400 {
+            // `invalid_node_id` — new on this route compared to `GET /nodes`,
+            // and unreachable from here: the id is formatted from a parsed
+            // `Uuid`. If it ever fires, the bug is on this side, so say so
+            // rather than leaving it to look like a KS fault. The body (which
+            // names the code) still reaches the caller through `check_status`.
+            eprintln!(
+                "[ks] BUG on the Mnemosyne side: KS rejected {node_id} as not a UUID. Body: {}",
+                body.chars().take(200).collect::<String>()
+            );
+        }
+        check_status(status, &body)?;
+        parse_node_response(&body).map(ByIdOutcome::Found)
     }
 
     async fn fetch_nodes(
@@ -780,6 +884,114 @@ mod tests {
             }
             Err(e) => panic!("KS call failed: {e}"),
         }
+    }
+
+    // -- GET /nodes/{id} -----------------------------------------------------
+
+    #[test]
+    fn by_id_response_is_a_bare_node_object() {
+        let node = parse_node_response(
+            r#"{"id":"5248a55b-ca35-4a33-8479-09d0ec0a6784","title":"Định luật II Newton",
+                "subject":"Vật lý","summary":"F = m*a."}"#,
+        )
+        .expect("the documented 200 shape should parse");
+
+        assert_eq!(node.title, "Định luật II Newton");
+        assert_eq!(node.subject, "Vật lý");
+    }
+
+    #[test]
+    fn by_id_response_wrapped_in_an_envelope_is_a_parse_error() {
+        // The contract states the object is returned bare. A wrapped body
+        // would be KS breaking it, and accommodating that quietly here would
+        // hide the drift from both sides.
+        assert!(parse_node_response(
+            r#"{"node":{"id":"5248a55b-ca35-4a33-8479-09d0ec0a6784","title":"t",
+                "subject":"s","summary":"x"}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn by_id_response_keeps_the_id_ks_returned() {
+        // Merge resolution: asking for a node that was merged away answers 200
+        // with the surviving node, so the id that comes back is deliberately
+        // not the id that was asked for. Nothing here may "correct" it.
+        let merged_into = "8bea853e-1cea-4114-a3b5-e77b487b88b9";
+        let node = parse_node_response(&format!(
+            r#"{{"id":"{merged_into}","title":"t","subject":"s","summary":"x"}}"#
+        ))
+        .unwrap();
+
+        assert_eq!(node.id, merged_into);
+    }
+
+    #[test]
+    fn a_json_404_from_ks_means_the_node_does_not_exist() {
+        assert!(matches!(
+            classify_not_found(r#"{"error":"node_not_found","detail":"no node with that id"}"#),
+            ByIdOutcome::NotFound
+        ));
+    }
+
+    #[test]
+    fn an_html_404_means_the_route_is_not_deployed() {
+        // Captured verbatim from the running KS before the route shipped:
+        // Werkzeug's default page, served with Content-Type text/html. Read as
+        // a real miss it would turn "this KS is older than the client" into
+        // "your concept does not exist".
+        let werkzeug = "<!doctype html>\n<html lang=en>\n<title>404 Not Found</title>\n                        <h1>Not Found</h1>\n<p>The requested URL was not found on the server.</p>";
+        assert!(matches!(
+            classify_not_found(werkzeug),
+            ByIdOutcome::RouteAbsent
+        ));
+    }
+
+    #[test]
+    fn an_unrecognised_json_404_falls_back_rather_than_guessing() {
+        // Misreading in this direction is the harmless one: the fallback list
+        // scan reaches the same `None`, one wasted call later.
+        assert!(matches!(
+            classify_not_found(r#"{"error":"something_else"}"#),
+            ByIdOutcome::RouteAbsent
+        ));
+    }
+
+    /// Proves this client against the real `GET /nodes/{id}` route. A fixture
+    /// can only show we handle a body we invented; this shows the route
+    /// answers the way the contract says and that a lookup does not silently
+    /// fall through to the list scan.
+    ///
+    ///     cargo test -p backend -- --ignored --nocapture live_get_node_by_id
+    #[tokio::test]
+    #[ignore = "requires a running Knowledge Store and a real KS_HTTP_TOKEN"]
+    async fn live_get_node_by_id() {
+        dotenvy::dotenv().ok();
+        dotenvy::from_filename("../.env").ok();
+
+        let client = KsClient::from_env().expect("KS_HTTP_TOKEN must be set in .env");
+
+        // Every node KS holds must be reachable one at a time.
+        let listed = client.get_nodes(None).await.expect("GET /nodes should work");
+        assert!(!listed.is_empty(), "KS has no nodes to look up");
+        for expected in &listed {
+            let id = Uuid::parse_str(&expected.id).expect("KS ids should be UUIDs");
+            let found = client
+                .get_node(id)
+                .await
+                .expect("a listed node must be fetchable by id")
+                .unwrap_or_else(|| panic!("node {id} listed but not found by id"));
+            eprintln!("[live] {id} -> {:?}", found.title);
+            assert_eq!(found.title, expected.title);
+        }
+
+        // And an id KS does not have must be a plain miss, not an error — the
+        // JSON 404 read as an answer rather than as a missing route.
+        let absent = Uuid::parse_str("ded135c9-0000-4000-8000-000000000000").unwrap();
+        assert!(
+            client.get_node(absent).await.expect("a 404 is an answer, not a failure").is_none(),
+            "an unknown id should be None"
+        );
     }
 
     // GET /nodes is live and confirmed working (it returns the documented

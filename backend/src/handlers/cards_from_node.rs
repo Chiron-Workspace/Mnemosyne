@@ -248,9 +248,15 @@ pub async fn from_node(
         Ok(None) => {
             return error_response(
                 actix_web::http::StatusCode::NOT_FOUND,
+                // Careful about the phrasing: `ks.nodes` has no status column,
+                // so there is no such thing as an unapproved node. A concept
+                // awaiting review lives in `ks.extracted_concepts` and becomes
+                // a node only once `ks.cli accept` runs — which is why its id
+                // is simply not a node id yet.
                 format!(
-                    "the Knowledge Store has no concept node {} — only accepted \
-                     concepts are available; one still pending review is not",
+                    "the Knowledge Store has no concept node {} — a concept \
+                     becomes a node only after `ks.cli accept` runs, so one \
+                     still awaiting review has no node id yet",
                     body.node_id
                 ),
             );
