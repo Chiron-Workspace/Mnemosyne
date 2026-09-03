@@ -194,3 +194,51 @@ The client sends no `max_tokens`, so it cannot be lowered from outside. Add the
 field to `ChatCompletionsRequest` temporarily, or call the API directly with the
 prompt `handlers::cards_from_node::build_prompt` produces. Do not commit a
 hardcoded budget — the absence of one is deliberate.
+
+---
+
+## 3. DeepSeek can answer HTTP 200 with an empty body
+
+Observed once, live, on 2026-09-03 at 15:07:58. A `POST /cards/from_node` call
+came back with a success status and **zero bytes** of body. The client did the
+right thing — `check_status` passes a 2xx, `serde_json` then fails on nothing at
+all — and the failure surfaced as:
+
+```
+parse error: EOF while parsing a value at line 1 column 0; body snippet:
+```
+
+The empty `body snippet:` is the tell, and the reason error messages carry one.
+Without it this reads as a JSON formatting problem and sends whoever is
+debugging to look at the prompt.
+
+### Why it is worth an entry
+
+This is the "HTTP 200 with an error body" case in the project's standing bug
+list, and this is the first time it has actually happened here. **A successful
+status is not a successful response.** Any code path that treats 2xx as
+permission to skip validation would have carried an empty string forward as if
+it were the model's answer — and in a card generator, an empty answer that
+reaches the review queue costs the learner a turn before anyone notices.
+
+It is rare: one occurrence across every AI call this project has made. Do not
+build retry logic specifically for it; do keep parsing strict, so that when it
+happens the error names the emptiness instead of blaming the parser.
+
+### Not to be confused with a client disconnect
+
+The same incident was initially suspected of being caused by a caller (the
+Knowledge Store's `card_sync`) timing out at 30s and dropping the connection
+mid-request. That is not what happened, and the distinction was settled by
+experiment: kill a client mid-call (`curl --max-time 2`) and the handler runs to
+completion anyway — the card is created and written some seconds after the
+caller is gone.
+
+**Actix does not cancel a handler when the client disconnects.** Two
+consequences follow. First, a dropped future could not have written the
+`ai_interactions` row that recorded this error, so the row's existence rules the
+theory out on its own. Second, a caller that gives up early does not stop the
+work; it creates an *orphaned outcome* — the card exists here while the caller
+recorded a failure. That is what the `existing_card_id` in the 409 body is for:
+the caller's next attempt learns which card its earlier request produced, and
+the two sides reconcile without anyone deleting anything.
