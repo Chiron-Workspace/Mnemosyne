@@ -129,3 +129,60 @@ that record:
   Postgres cluster shared with the Knowledge Store. All 38 `.persistent(false)`
   calls across nine files and the `statement_cache_capacity(0)` option in
   `main.rs` were removed in that change.
+---
+
+## 2. DeepSeek reasoning tokens: truncation is non-deterministic, and often arrives with partial content
+
+`deepseek-v4-flash` is a reasoning model. Reasoning tokens are billed against
+the completion budget but never appear in `choices[0].message.content`, so a
+call that runs out of budget comes back looking like an ordinary response that
+merely happens to be empty — or, worse, cut off mid-sentence. Only
+`finish_reason` says otherwise. This is why every provider call is rejected as
+`LLMError::Truncated` at the client boundary (`deepseek.rs::to_llm_response`)
+instead of each handler checking for itself.
+
+### Measured, not assumed
+
+Same node, same prompt, same model, `temperature` unset — 10 identical calls at
+each budget, run 2026-09-03 against the live API:
+
+| `max_tokens` | truncated | reasoning tokens observed | truncated replies carrying partial content |
+|---|---|---|---|
+| 200 | 10/10 | 200 (pinned at the ceiling) | 0/10 |
+| 350 | 10/10 | 232 – 350 | 5/10 (up to 310 chars) |
+| 500 | 8/10 | 78 – 500 | 2/8 |
+| 650 | 7/10 | 162 – 650 | 2/7 |
+
+Two things follow, and they pull in opposite directions:
+
+**Reasoning consumption is wildly non-deterministic on identical input.** At
+`max_tokens=650` the same request spent anywhere from 162 to 650 reasoning
+tokens — a 4× spread with nothing varying on our side. Any logic that assumes a
+prompt has a stable cost is wrong.
+
+**A truncated reply frequently contains text.** Half the truncated calls at
+`max_tokens=350` returned real, non-empty content — a half-written JSON object.
+Handed to a parser, that reports a formatting error and sends whoever reads it
+looking at the prompt instead of at the budget. This is the concrete failure the
+`finish_reason` check prevents, reproduced deliberately rather than argued for.
+
+### Is retrying a truncated call worth anything?
+
+Only near the boundary. Well below it (`max_tokens` 200 and 350) retrying the
+same input succeeded **0 times in 20**. In the marginal band (500, 650) the
+variance is enough to get through on **2–3 attempts in 10**. So neither
+absolute is right: "truncation always repeats" is false, and "just retry" is
+false too. One or two retries are worth it at most; the reliable fix is to give
+the call more budget or ask it for less.
+
+Note that Mnemosyne sends **no** `max_tokens` at all — the model's own default
+applies. Truncation in normal operation therefore means reasoning consumed that
+entire default, which is far outside the band measured here. There is no
+measurement for that regime; do not assume these retry odds carry over to it.
+
+### How to reproduce
+
+The client sends no `max_tokens`, so it cannot be lowered from outside. Add the
+field to `ChatCompletionsRequest` temporarily, or call the API directly with the
+prompt `handlers::cards_from_node::build_prompt` produces. Do not commit a
+hardcoded budget — the absence of one is deliberate.
