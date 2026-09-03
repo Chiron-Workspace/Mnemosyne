@@ -88,6 +88,20 @@ pub struct DeepSeekUsage {
     #[serde(default)]
     #[allow(dead_code)]
     pub completion_tokens: u32,
+    /// Breakdown of the completion side. Absent on responses from
+    /// non-reasoning models, hence `Option`.
+    #[serde(default)]
+    pub completion_tokens_details: Option<DeepSeekCompletionDetails>,
+}
+
+/// The part of `usage` that says how much of the completion budget went to
+/// reasoning the caller never sees. This is the number that explains an
+/// otherwise inexplicable truncation, so it is parsed even though nothing but
+/// the truncation log reads it.
+#[derive(Debug, Deserialize, Default)]
+pub struct DeepSeekCompletionDetails {
+    #[serde(default)]
+    pub reasoning_tokens: u32,
 }
 
 /// Errors from the DeepSeek client. All variants keep the API key out of any
@@ -204,6 +218,31 @@ fn finish_reason_of(resp: &DeepSeekResponse) -> &str {
 fn to_llm_response(resp: DeepSeekResponse) -> Result<LLMResponse, LLMError> {
     let finish_reason = finish_reason_of(&resp).to_string();
     if finish_reason == FINISH_REASON_LENGTH {
+        // Say what it cost, on the way out. `LLMError` carries no usage, so
+        // the handler that catches this records `tokens_used = 0`: a truncated
+        // call is the most expensive kind of failure and the one that leaves
+        // no trace in the ledger. Until the error variant carries usage — a
+        // change that touches every call site, so not one to make in passing —
+        // stderr is the only place these numbers survive.
+        //
+        // `reasoning_tokens` is the number that explains the failure. It is
+        // billed against the completion budget and never appears in the
+        // output, so a call can spend its whole allowance thinking and return
+        // an empty string.
+        let reasoning = resp
+            .usage
+            .completion_tokens_details
+            .as_ref()
+            .map(|d| d.reasoning_tokens);
+        eprintln!(
+            "[deepseek] TRUNCATED (finish_reason=length): total_tokens={} prompt={} \
+             completion={} reasoning={} content_chars={}",
+            resp.usage.total_tokens,
+            resp.usage.prompt_tokens,
+            resp.usage.completion_tokens,
+            reasoning.map_or_else(|| "unreported".to_string(), |r| r.to_string()),
+            resp.choices.first().map_or(0, |c| c.message.content.chars().count()),
+        );
         return Err(LLMError::Truncated { finish_reason });
     }
 
@@ -385,6 +424,42 @@ mod tests {
         .expect_err("valid JSON plus finish_reason=length is still truncation");
 
         assert!(matches!(err, LLMError::Truncated { .. }));
+    }
+
+    #[test]
+    fn reasoning_tokens_are_parsed_off_the_usage_breakdown() {
+        // The number that explains a truncation: billed against the completion
+        // budget, never present in the output. Without it a truncated call is
+        // just "it failed", with no way to see that the whole allowance went
+        // to reasoning.
+        let resp: DeepSeekResponse = serde_json::from_str(
+            r#"{
+            "choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"total_tokens": 300, "prompt_tokens": 100, "completion_tokens": 200,
+                      "completion_tokens_details": {"reasoning_tokens": 162}}
+        }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resp.usage.completion_tokens_details.map(|d| d.reasoning_tokens),
+            Some(162)
+        );
+    }
+
+    #[test]
+    fn a_usage_block_without_the_breakdown_still_parses() {
+        // Non-reasoning models omit it entirely; that must not turn an
+        // otherwise fine response into a parse error.
+        let resp: DeepSeekResponse = serde_json::from_str(
+            r#"{
+            "choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"total_tokens": 5}
+        }"#,
+        )
+        .unwrap();
+
+        assert!(resp.usage.completion_tokens_details.is_none());
     }
 
     #[test]
