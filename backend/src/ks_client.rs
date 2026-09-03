@@ -471,9 +471,19 @@ impl KsClient {
     ///
     /// Prefers `GET /nodes/{id}`, and falls back to listing nodes and picking
     /// the match here when that route is not deployed on the KS being talked
-    /// to. The fallback is what this method used to do outright; it stays only
-    /// until the by-id route is confirmed live, because the two paths are not
-    /// equivalent:
+    /// to — that is, when this client is newer than the KS it is pointed at.
+    /// The fallback is what this method used to do outright. It stays as a
+    /// version-skew guard: two services developed side by side in one repo
+    /// checkout drift apart the moment one of them is checked out at an older
+    /// commit, and the failure it prevents ("your concept does not exist") is
+    /// far more confusing than the one it costs.
+    ///
+    /// It is **not** a guard against KS being down or restarting — a KS that is
+    /// not listening refuses the connection, which surfaces as
+    /// [`KsError::Unreachable`] and never reaches the fallback.
+    ///
+    /// The two paths are not equivalent, which is why taking the fallback logs
+    /// a warning rather than substituting silently:
     ///
     /// - The by-id route **resolves merges**: ask for a node that was merged
     ///   into another and KS answers 200 with the surviving node, whose `id`
@@ -495,6 +505,16 @@ impl KsClient {
             ByIdOutcome::Found(node) => Ok(Some(node)),
             ByIdOutcome::NotFound => Ok(None),
             ByIdOutcome::RouteAbsent => {
+                // Loud on purpose. The answer this path gives can differ from
+                // the by-id route's (no merge resolution), so a silent
+                // substitution would leave the difference to be discovered as
+                // a mystery later.
+                eprintln!(
+                    "[ks] WARNING: this Knowledge Store has no GET /nodes/{{id}} route — \
+                     falling back to a list scan for {node_id}. The Knowledge Store is \
+                     older than this client; a node that was merged into another will \
+                     read as missing on this path."
+                );
                 let nodes = self.fetch_nodes(None, Some(NODE_LOOKUP_LIMIT)).await?;
                 Ok(find_node_by_id(nodes, node_id))
             }
