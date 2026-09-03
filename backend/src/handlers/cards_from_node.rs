@@ -18,23 +18,25 @@
 //! the model phrases the same concept differently every time; comparing text
 //! would never match.
 //!
-//! ## Telling the two 502s apart
+//! ## Telling the 502s apart
 //!
-//! A `502` body carries a machine-readable `reason` beside the usual `error`
-//! message, so a caller can branch on it instead of pattern-matching prose:
+//! Every `502` body carries a machine-readable `reason` beside the usual
+//! `error` message, so a caller can branch on it instead of pattern-matching
+//! prose. The three values differ in what a retry is worth:
 //!
 //! - `"truncated"` — the model ran out of token budget mid-answer
-//!   ([`LLMError::Truncated`]). Retrying the same input tends to run out at the
-//!   same place; asking for less is the move that helps.
-//! - `"provider_error"` — every other provider-side failure: network, an
-//!   upstream status, or output that arrived whole and could not be used. Often
-//!   transient, so one retry is reasonable.
-//!
-//! The single `502` with no `reason` is a failed Knowledge Store lookup, which
-//! is not an LLM failure at all. That absence is deliberate rather than an
-//! oversight: a caller that retries unless `reason` is `"truncated"` already
-//! treats it correctly, since a KS blip is exactly the kind of thing a retry
-//! fixes.
+//!   ([`LLMError::Truncated`]). **Do not retry the same input**: the same
+//!   prompt against the same budget runs out at the same place. Asking for less
+//!   is the move that helps.
+//! - `"provider_error"` — any other LLM-side failure: network, an upstream
+//!   status, or output that arrived whole and could not be parsed or used.
+//!   **Retry with a bound.** It may be transient, but it may equally be a
+//!   lasting misconfiguration — an invalid API key answers 401 every time —
+//!   so an unbounded retry loop would hammer a wall.
+//! - `"knowledge_store_error"` — the concept could not be read from the
+//!   Knowledge Store. **Safe to retry**, and usually worth it: this is a blip
+//!   on the second network hop (caller → Mnemosyne → Knowledge Store) and
+//!   clears on its own far more often than the other two.
 //!
 //! `reason` is local to this endpoint. The other AI handlers still return a
 //! bare `{"error": …}` — the split exists because the Knowledge Store's
@@ -46,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use crate::ks_client::{KsClient, KsNode};
+use crate::ks_client::{KsClient, KsError, KsNode};
 use crate::llm_provider::{LLMError, LLMMessage, LLMProvider};
 use super::{describe_llm_failure, error_response};
 
@@ -56,8 +58,11 @@ const SOURCE_KNOWLEDGE_STORE: &str = "knowledge_store";
 /// `reason` on a 502: the model ran out of token budget mid-answer.
 const REASON_TRUNCATED: &str = "truncated";
 
-/// `reason` on a 502: any other provider-side failure.
+/// `reason` on a 502: any other LLM-side failure.
 const REASON_PROVIDER_ERROR: &str = "provider_error";
+
+/// `reason` on a 502: the concept could not be read from the Knowledge Store.
+const REASON_KNOWLEDGE_STORE_ERROR: &str = "knowledge_store_error";
 
 #[derive(Debug, Deserialize)]
 pub struct FromNodeRequest {
@@ -252,10 +257,7 @@ pub async fn from_node(
         }
         Err(e) => {
             eprintln!("[ks] node lookup failed for {}: {e}", body.node_id);
-            return error_response(
-                actix_web::http::StatusCode::BAD_GATEWAY,
-                format!("could not read the concept from the Knowledge Store: {e}"),
-            );
+            return knowledge_store_error(&e);
         }
     };
 
@@ -413,6 +415,22 @@ fn llm_failure_reason(err: &LLMError) -> &'static str {
         LLMError::Truncated { .. } => REASON_TRUNCATED,
         _ => REASON_PROVIDER_ERROR,
     }
+}
+
+/// 502 for a Knowledge Store lookup that failed.
+///
+/// It gets its own `reason` rather than sharing `provider_error`, because the
+/// two carry different odds and so deserve different retry policies. This one
+/// is nearly always a blip on the second network hop — the caller reaches
+/// Mnemosyne, Mnemosyne reaches the Knowledge Store — and clears by itself,
+/// whereas a provider failure can just as easily be a lasting
+/// misconfiguration. Folded together, a caller would have to pick one policy
+/// and be wrong for the other half of the cases.
+fn knowledge_store_error(err: &KsError) -> HttpResponse {
+    upstream_error(
+        format!("could not read the concept from the Knowledge Store: {err}"),
+        REASON_KNOWLEDGE_STORE_ERROR,
+    )
 }
 
 fn upstream_error(message: impl Into<String>, reason: &'static str) -> HttpResponse {
@@ -658,6 +676,49 @@ mod tests {
 
         assert_eq!(status, 502);
         assert_eq!(body["reason"], "provider_error");
+    }
+
+    #[tokio::test]
+    async fn a_failed_knowledge_store_lookup_gets_its_own_reason() {
+        // Not an LLM failure at all, and the most retryable of the three: KS
+        // was simply not answering on the second hop. Sharing provider_error
+        // would tell the caller to give up after a couple of tries on the one
+        // failure most likely to clear by itself.
+        //
+        // Driven through the same function the handler calls, with a real
+        // KsError — KsClient is a concrete struct with a localhost-only base
+        // URL, so faking get_node itself would mean standing up an HTTP
+        // server for no added coverage of this mapping.
+        let (status, body) = parts_of(knowledge_store_error(&KsError::Unreachable(
+            "error sending request: connection refused".into(),
+        )))
+        .await;
+
+        assert_eq!(status, 502);
+        assert_eq!(body["reason"], "knowledge_store_error");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("connection refused"),
+            "the cause should survive into the message: {}",
+            body["error"]
+        );
+    }
+
+    #[test]
+    fn the_three_reasons_are_distinct() {
+        // They only earn their keep if a caller can tell them apart.
+        let all = [
+            REASON_TRUNCATED,
+            REASON_PROVIDER_ERROR,
+            REASON_KNOWLEDGE_STORE_ERROR,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
     }
 
     #[test]
