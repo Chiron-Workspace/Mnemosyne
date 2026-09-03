@@ -242,3 +242,30 @@ work; it creates an *orphaned outcome* — the card exists here while the caller
 recorded a failure. That is what the `existing_card_id` in the 409 body is for:
 the caller's next attempt learns which card its earlier request produced, and
 the two sides reconcile without anyone deleting anything.
+
+---
+
+## 4. Cards sourced from the Knowledge Store cannot be deleted one side at a time
+
+Eight cards in the study set **"KS review"** (`27735bfe-…`) came from Knowledge
+Store nodes via `POST /cards/from_node`, driven by KS's `card_sync` job. Six of
+them — stellar evolution, Gödel's incompleteness theorem, the Sorites paradox,
+Schrödinger's cat, the Ship of Theseus, the trolley problem — exist because KS
+was deliberately hunting for a truncated LLM response on 2026-09-03, not because
+any learner studied those concepts. They are coherent cards and they cost real
+tokens; the provenance is recorded here only so that nobody later finds the
+trolley problem in a physics learner's queue and assumes something went wrong.
+
+**The trap, which applies to every KS-sourced card and not just these:** the two
+sides must be deleted together or not at all.
+
+- Delete the card here but leave the node in `ks.nodes`, and `card_sync`
+  recreates it on its next hourly run. The deletion silently undoes itself.
+- Delete the node in KS but leave the card here, and the card is orphaned: its
+  `source_node_id` points at a row that no longer exists. Nothing enforces this —
+  KS is a different database, so there is no foreign key to catch it (see the
+  `cards_node_id_iff_knowledge_store` CHECK constraint, which is all the
+  integrity that is available across that boundary).
+
+So a cleanup is a two-sided operation, coordinated with whoever runs KS. A
+one-sided one is not a smaller version of it; it is a different, worse outcome.
