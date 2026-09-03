@@ -17,6 +17,28 @@
 //! Deduplication is on the node id rather than on the generated text because
 //! the model phrases the same concept differently every time; comparing text
 //! would never match.
+//!
+//! ## Telling the two 502s apart
+//!
+//! A `502` body carries a machine-readable `reason` beside the usual `error`
+//! message, so a caller can branch on it instead of pattern-matching prose:
+//!
+//! - `"truncated"` — the model ran out of token budget mid-answer
+//!   ([`LLMError::Truncated`]). Retrying the same input tends to run out at the
+//!   same place; asking for less is the move that helps.
+//! - `"provider_error"` — every other provider-side failure: network, an
+//!   upstream status, or output that arrived whole and could not be used. Often
+//!   transient, so one retry is reasonable.
+//!
+//! The single `502` with no `reason` is a failed Knowledge Store lookup, which
+//! is not an LLM failure at all. That absence is deliberate rather than an
+//! oversight: a caller that retries unless `reason` is `"truncated"` already
+//! treats it correctly, since a KS blip is exactly the kind of thing a retry
+//! fixes.
+//!
+//! `reason` is local to this endpoint. The other AI handlers still return a
+//! bare `{"error": …}` — the split exists because the Knowledge Store's
+//! card-sync job needs to branch on it, and so far nothing else does.
 
 use actix_web::{post, web, HttpResponse};
 use chrono::{DateTime, Utc};
@@ -25,11 +47,17 @@ use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
 use crate::ks_client::{KsClient, KsNode};
-use crate::llm_provider::{LLMMessage, LLMProvider};
+use crate::llm_provider::{LLMError, LLMMessage, LLMProvider};
 use super::{describe_llm_failure, error_response};
 
 /// Value of `cards.source` written by this handler.
 const SOURCE_KNOWLEDGE_STORE: &str = "knowledge_store";
+
+/// `reason` on a 502: the model ran out of token budget mid-answer.
+const REASON_TRUNCATED: &str = "truncated";
+
+/// `reason` on a 502: any other provider-side failure.
+const REASON_PROVIDER_ERROR: &str = "provider_error";
 
 #[derive(Debug, Deserialize)]
 pub struct FromNodeRequest {
@@ -62,6 +90,16 @@ pub struct FromNodeResponse {
 struct AlreadyExistsResponse {
     error: String,
     existing_card_id: Uuid,
+}
+
+/// 502 body. `error` stays the same human-readable message every other
+/// endpoint returns; `reason` is the machine-readable half. Without it the
+/// only way to tell a truncated generation from a network blip is to read the
+/// message text, which is not something a caller should have to depend on.
+#[derive(Debug, Serialize)]
+struct UpstreamErrorResponse {
+    error: String,
+    reason: &'static str,
 }
 
 #[derive(Debug, FromRow)]
@@ -241,7 +279,7 @@ pub async fn from_node(
             let _ =
                 log_ai_interaction(pool.get_ref(), owner.user_id, &prompt_log, &placeholder, 0)
                     .await;
-            return error_response(actix_web::http::StatusCode::BAD_GATEWAY, message);
+            return upstream_error(message, llm_failure_reason(&api_err));
         }
     };
     let raw = resp.content;
@@ -257,9 +295,10 @@ pub async fn from_node(
                 resp.total_tokens,
             )
             .await;
-            return error_response(
-                actix_web::http::StatusCode::BAD_GATEWAY,
+            // Not truncation: the answer arrived whole, it just was not JSON.
+            return upstream_error(
                 format!("DeepSeek returned non-JSON output, parse failed: {parse_err}"),
+                REASON_PROVIDER_ERROR,
             );
         }
     };
@@ -273,9 +312,9 @@ pub async fn from_node(
             resp.total_tokens,
         )
         .await;
-        return error_response(
-            actix_web::http::StatusCode::BAD_GATEWAY,
+        return upstream_error(
             format!("DeepSeek returned an unusable card; nothing inserted: {validation_err}"),
+            REASON_PROVIDER_ERROR,
         );
     }
 
@@ -364,6 +403,25 @@ async fn existing_card(
     .await
 }
 
+/// Which `reason` an [`LLMError`] maps to. Truncation is the only variant
+/// singled out, because it is the only one where retrying the same input
+/// unchanged is predictably pointless: the same prompt against the same budget
+/// runs out at the same place. Everything else — a timeout, a 429, output that
+/// would not parse — can plausibly go differently next time.
+fn llm_failure_reason(err: &LLMError) -> &'static str {
+    match err {
+        LLMError::Truncated { .. } => REASON_TRUNCATED,
+        _ => REASON_PROVIDER_ERROR,
+    }
+}
+
+fn upstream_error(message: impl Into<String>, reason: &'static str) -> HttpResponse {
+    HttpResponse::BadGateway().json(UpstreamErrorResponse {
+        error: message.into(),
+        reason,
+    })
+}
+
 fn already_exists(node_id: Uuid, existing_card_id: Uuid) -> HttpResponse {
     HttpResponse::Conflict().json(AlreadyExistsResponse {
         error: format!("this study set already has a card for concept node {node_id}"),
@@ -395,6 +453,7 @@ async fn log_ai_interaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm_provider::LLMResponse;
 
     fn node() -> KsNode {
         KsNode {
@@ -507,6 +566,120 @@ mod tests {
         assert_eq!(body["question"], "q");
         assert_eq!(body["source"], "knowledge_store");
         assert_eq!(body["tokens_used"], 123);
+    }
+
+    // -- why a 502 happened --------------------------------------------------
+
+    /// A stand-in provider, so these tests go through the real
+    /// [`LLMProvider`] boundary the handler calls rather than hand-building an
+    /// [`LLMError`] that the trait might never actually produce.
+    struct FakeProvider {
+        outcome: fn() -> Result<LLMResponse, LLMError>,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for FakeProvider {
+        async fn chat_completion(
+            &self,
+            _messages: &[LLMMessage],
+            _model: Option<&str>,
+        ) -> Result<LLMResponse, LLMError> {
+            (self.outcome)()
+        }
+    }
+
+    async fn parts_of(resp: HttpResponse) -> (u16, serde_json::Value) {
+        let status = resp.status().as_u16();
+        let bytes = actix_web::body::to_bytes(resp.into_body())
+            .await
+            .expect("the body should be readable");
+        (
+            status,
+            serde_json::from_slice(&bytes).expect("an error body should be JSON"),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_truncated_generation_is_reported_as_reason_truncated() {
+        // finish_reason == "length" never reaches a handler as a success — the
+        // provider rejects it — so what arrives here is LLMError::Truncated.
+        let provider = FakeProvider {
+            outcome: || {
+                Err(LLMError::Truncated {
+                    finish_reason: "length".into(),
+                })
+            },
+        };
+        let err = provider
+            .chat_completion(&[], None)
+            .await
+            .expect_err("this fake provider only fails");
+
+        let (_, message) = describe_llm_failure(&err);
+        let (status, body) = parts_of(upstream_error(message, llm_failure_reason(&err))).await;
+
+        assert_eq!(status, 502);
+        assert_eq!(body["reason"], "truncated");
+        // The prose message is unchanged; `reason` is additive.
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("token limit"),
+            "error: {}",
+            body["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn output_that_will_not_parse_is_reported_as_reason_provider_error() {
+        // The opposite case: the call succeeded, stopped normally and cost
+        // tokens — the model simply answered in prose. Nothing about it is
+        // worth telling apart from a network failure, since the advice to the
+        // caller ("try again") is the same.
+        let provider = FakeProvider {
+            outcome: || {
+                Ok(LLMResponse {
+                    content: "Here is your flashcard!".to_string(),
+                    total_tokens: 42,
+                    finish_reason: "stop".to_string(),
+                })
+            },
+        };
+        let resp = provider
+            .chat_completion(&[], None)
+            .await
+            .expect("a non-JSON answer is still a successful call");
+        let parse_err =
+            parse_generated_card(&resp.content).expect_err("prose is not a card");
+
+        let (status, body) = parts_of(upstream_error(
+            format!("DeepSeek returned non-JSON output, parse failed: {parse_err}"),
+            REASON_PROVIDER_ERROR,
+        ))
+        .await;
+
+        assert_eq!(status, 502);
+        assert_eq!(body["reason"], "provider_error");
+    }
+
+    #[test]
+    fn every_non_truncation_failure_maps_to_provider_error() {
+        // A new LLMError variant defaults to "provider_error" (retryable),
+        // which is the safe side to fail on: at worst the caller wastes a
+        // retry, whereas a wrong "truncated" would suppress one that would
+        // have worked.
+        for err in [
+            LLMError::Network("timeout".into()),
+            LLMError::Http {
+                status: 429,
+                body: "rate limited".into(),
+            },
+            LLMError::Parse("bad json".into()),
+        ] {
+            assert_eq!(
+                llm_failure_reason(&err),
+                REASON_PROVIDER_ERROR,
+                "unexpected reason for {err:?}"
+            );
+        }
     }
 
     #[test]
