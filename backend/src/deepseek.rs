@@ -365,6 +365,29 @@ mod tests {
     }
 
     #[test]
+    fn truncation_is_rejected_even_when_the_partial_content_is_valid_json() {
+        // The quietest shape of all, and the one no parser can catch: the
+        // model closed its brackets and *then* ran out. Here it returned one
+        // card where the caller may have asked for several — syntactically
+        // perfect, semantically short. Prioritising "it parsed, so use it"
+        // would silently deliver part of an answer as the whole of it, with
+        // nothing anywhere reporting a problem.
+        //
+        // So the budget outranks the syntax: a truncated reply is discarded,
+        // never salvaged. Only `finish_reason` can tell these apart, which is
+        // exactly why it is checked before the content is ever looked at.
+        let err = convert(
+            r#"{
+            "choices": [{"message": {"role": "assistant", "content": "[{\"question\": \"Q1\", \"answer\": \"A1\"}]"}, "finish_reason": "length"}],
+            "usage": {"total_tokens": 4096}
+        }"#,
+        )
+        .expect_err("valid JSON plus finish_reason=length is still truncation");
+
+        assert!(matches!(err, LLMError::Truncated { .. }));
+    }
+
+    #[test]
     fn truncation_error_message_names_the_cause() {
         // Whoever reads this in a log should not have to guess why an
         // otherwise-successful call produced nothing.

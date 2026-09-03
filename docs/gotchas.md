@@ -166,6 +166,14 @@ Handed to a parser, that reports a formatting error and sends whoever reads it
 looking at the prompt instead of at the budget. This is the concrete failure the
 `finish_reason` check prevents, reproduced deliberately rather than argued for.
 
+There is a third shape, quieter than either, that the table above cannot show:
+the model closes its brackets and *then* runs out. The content parses cleanly
+and reports no error at all — it is simply **short**, three items where five
+were asked for. Nothing downstream would notice. This is why the rule is that
+the token budget outranks parseability: a truncated reply is discarded, never
+salvaged, however well-formed it looks. Only `finish_reason` distinguishes it,
+which is why it is read before the content ever is.
+
 ### Is retrying a truncated call worth anything?
 
 Only near the boundary. Well below it (`max_tokens` 200 and 350) retrying the
