@@ -15,6 +15,9 @@ pub mod socratic;
 pub mod study_sets;
 pub mod users;
 
+#[cfg(test)]
+pub mod test_db;
+
 use actix_web::HttpResponse;
 
 use crate::llm_provider::LLMError;
