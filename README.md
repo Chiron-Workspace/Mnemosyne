@@ -17,7 +17,7 @@ Most flashcard apps implement one learning principle (usually spaced repetition)
 | Principle | How it's implemented |
 |---|---|
 | **Spaced Repetition** | [FSRS](https://github.com/open-spaced-repetition/fsrs-rs) (not the older SM-2), chosen after a dedicated algorithm comparison — see [ADR 0001](docs/adr/0001-spaced-repetition-algorithm.md) |
-| **Active Recall / SAFMEDS** | AI-generated short-answer flashcards (1–5 word answers) from any source text |
+| **Active Recall / SAFMEDS** | AI-generated short-answer flashcards — from source text (`POST /study_sets/{id}/generate_cards`), or from a Knowledge Store concept node the learner has already studied (`POST /cards/from_node`) |
 | **Socratic Questioning** | Multi-turn AI dialogue that asks guiding questions and flags misconceptions, rather than lecturing |
 | **Feynman Technique** | Learners write free-text explanations; AI scores clarity/completeness/correctness (1–10 each) with actionable feedback |
 
@@ -31,6 +31,7 @@ Mnemosyne is a backend module of the Chiron ecosystem. It is feature-complete fo
 - [x] Milestone 2 — Core learning engine (FSRS scheduling wired to a live DB, AI question generation)
 - [x] Milestone 3 — Socratic Tutor + Feynman Evaluation
 - [x] Milestone 4 — Chiron integration (local Postgres, transcript hand-off to the Knowledge Store)
+- [x] Milestone 5 — Knowledge Store card generation loop: `POST /cards/from_node` turns one approved KS concept node into one flashcard, idempotent via a `UNIQUE(set_id, source_node_id)` constraint, with a machine-readable `reason` on every failure so a caller (namely the Knowledge Store's own `card_sync` job) can tell a token-budget truncation apart from a transient network blip. Verified end-to-end against production data, not just fixtures.
 - [ ] User authentication (currently a known, documented limitation — see below)
 
 ---
@@ -38,10 +39,10 @@ Mnemosyne is a backend module of the Chiron ecosystem. It is feature-complete fo
 ## Tech Stack
 
 - **Backend:** Rust, [Actix-web](https://actix.rs/)
-- **Database:** PostgreSQL (local cluster shared with the Knowledge Store, own `mnemosyne` database), accessed with [`sqlx`](https://github.com/launchbadge/sqlx)
+- **Database:** PostgreSQL (local cluster shared with the Knowledge Store, own `mnemosyne` database) — separate databases on the same cluster, no cross-database foreign keys; provenance columns like `cards.source_node_id` are a traceability breadcrumb, not an enforced reference
 - **Spaced repetition:** [`fsrs`](https://crates.io/crates/fsrs) crate (FSRS v6.6.1)
-- **LLM:** [DeepSeek](https://www.deepseek.com/) (V4 Flash for cost-sensitive generation, V4 Pro for heavier reasoning)
-- **Knowledge Store:** local HTTP service (`chiron-ks-http.service`) receiving session transcripts
+- **LLM:** [DeepSeek](https://www.deepseek.com/), model `deepseek-v4-flash` — a *reasoning* model whose thinking tokens count against `max_tokens` without appearing in the response. Every call site checks `finish_reason` explicitly for this reason (see `docs/gotchas.md`); a cut-off answer is rejected outright rather than handed to a JSON parser, which would otherwise misreport it as a formatting error
+- **Knowledge Store:** local HTTP service (`chiron-ks-http.service`) — the integration is two-way: Mnemosyne hands off session transcripts to it after a Socratic dialogue ends, and it calls back into Mnemosyne's `POST /cards/from_node` (via its own `card_sync` job) to turn a learner-approved concept into a flashcard
 
 ---
 
@@ -52,9 +53,19 @@ See [`docs/architecture.md`](docs/architecture.md) for a full diagram distinguis
 ```
 Client (coding agent / Chiron OS shell)
            ↓ HTTP
-       Actix-web backend  ──→  mnemosyne-core (FSRS scheduling wrapper)
-           ↓ sqlx              ↓                    ↓
-   local PostgreSQL     DeepSeek API      Knowledge Store (transcripts)
+       Actix-web backend ──────────────→ mnemosyne-core (FSRS scheduling wrapper)
+           │        │
+           │        └───────────────→ DeepSeek API (chat completions — deepseek.rs
+           │                          is the only module that knows the wire format)
+           ↓ sqlx
+   local PostgreSQL (own `mnemosyne` database, same cluster as the Knowledge Store)
+
+Knowledge Store ──POST /cards/from_node──→ Mnemosyne   (its card_sync job turning an
+                                                         approved concept node into a card)
+Mnemosyne       ──POST /transcripts──────→ Knowledge Store (hand-off when a Socratic
+                                                             dialogue ends)
+Mnemosyne       ──GET /nodes, /nodes/{id}→ Knowledge Store (reading a concept back to
+                                                             build the flashcard prompt)
 ```
 
 ---
@@ -67,6 +78,7 @@ Client (coding agent / Chiron OS shell)
 | `POST /users`, `GET /users` | User accounts |
 | `POST /study_sets`, `GET /study_sets` | Study set (topic) management |
 | `POST /cards`, `GET /cards` | Flashcard CRUD |
+| `POST /cards/from_node` | Turn one Knowledge Store concept node into one flashcard. Idempotent per `(study_set_id, node_id)` — a repeat call returns `409` with the existing card's id rather than a duplicate. On failure, `502` carries a machine-readable `reason`: `truncated` (the model hit its token budget — retrying the same input won't help), `provider_error` (network/upstream/unparseable — retry with a bound), or `knowledge_store_error` (the node couldn't be read from the Knowledge Store — usually safe to retry) |
 | `POST /review` | Submit a card review rating → FSRS reschedules it |
 | `GET /due` | Fetch cards due for review right now |
 | `POST /study_sets/{id}/generate_cards` | AI-generate flashcards from source text (`recall` or `elaboration` style) |
@@ -95,12 +107,18 @@ Full request/response shapes are documented inline in each handler under `backen
 2. Fill in `.env`:
    - `DATABASE_URL` — your local Postgres URI, e.g. `postgresql://postgres@127.0.0.1:5432/mnemosyne`
    - `DEEPSEEK_API_KEY` — from DeepSeek's platform
-   - `KS_HTTP_TOKEN` — bearer token for the Knowledge Store HTTP API. Optional: leave it empty and transcript sync is skipped with a startup warning; study sessions are unaffected.
-3. Create the database and apply the schema (this one file includes all tables from migrations 0001–0003; a fresh setup does not need the individual migrations):
+   - `KS_HTTP_TOKEN` — bearer token for the Knowledge Store HTTP API. Gates two things now, not one: leave it empty and transcript hand-off is skipped with a startup warning (study sessions are otherwise unaffected), but `POST /cards/from_node` will refuse outright with `503` — it has no way to read the concept it's supposed to turn into a card without it.
+3. Create the database and apply the schema:
    ```bash
    psql -h 127.0.0.1 -p 5432 -U postgres -c 'CREATE DATABASE mnemosyne'
    psql -h 127.0.0.1 -p 5432 -U postgres -d mnemosyne -f backend/sql/schema.sql
    ```
+   `schema.sql` is the fresh-install baseline; check its own header for the migration it was last regenerated from. Migrations newer than that baseline still need applying by hand, in order, e.g.:
+   ```bash
+   psql -h 127.0.0.1 -p 5432 -U postgres -d mnemosyne -f backend/sql/migrations/0004_add_quiz_tables.sql
+   psql -h 127.0.0.1 -p 5432 -U postgres -d mnemosyne -f backend/sql/migrations/0005_add_card_source_tracking.sql
+   ```
+   These are plain SQL files applied by hand — nothing in the repo tracks which ones have already run against a given database. `0005` in particular is **not** safe to apply twice (its `ADD COLUMN`/`ADD CONSTRAINT` statements have no `IF NOT EXISTS` guard and will error on a second run), so don't re-run a migration once it's landed.
 4. Build and run:
    ```bash
    cargo build --workspace
@@ -116,7 +134,7 @@ Full request/response shapes are documented inline in each handler under `backen
 - [`docs/spaced-rep-spike.md`](docs/spaced-rep-spike.md) — FSRS vs. SM-2 comparison
 - [`docs/adr/`](docs/adr/) — architecture decision records
 - [`docs/architecture.md`](docs/architecture.md) — system diagram
-- [`docs/gotchas.md`](docs/gotchas.md) — infrastructure issues discovered during development and their fixes (the Supabase pooler / prepared-statement entry is retained as history; it no longer applies)
+- [`docs/gotchas.md`](docs/gotchas.md) — infrastructure issues discovered during development and their fixes, including the DeepSeek reasoning-token truncation behavior (`finish_reason == "length"` is checked on every call site, not just one — a cut-off answer otherwise looks like an ordinary, merely malformed, response) (the Supabase pooler / prepared-statement entry is retained as history; it no longer applies)
 - [`docs/case-study.md`](docs/case-study.md) — full research case study, including adversarial testing of the AI features (sycophancy detection, scoring-discrimination validation)
 
 ---
